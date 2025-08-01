@@ -1,0 +1,138 @@
+功能 1 hasHccEvent - 判斷使用者是否符合某活動的參加資格
+
+    請求參數
+        String hccEventType, List<String> memberTypes, String appId
+    範例
+        {
+            "hccEventType": "NORMAL_DEDUCT_POINT",
+            "memberTypes": ["SOGO_VIP", "SOGO_VVIP"],
+            "appId": "A000111222"
+        }
+
+    回傳資料
+        boolean hasEvent
+    範例
+        {
+            "hasEvent": true
+        }
+
+
+語法
+SELECT COUNT(*) 
+FROM gif_hcc_event he   -- 活動主表
+LEFT JOIN gif_event e
+    ON he.event_no = e.event_no   -- 對應通用活動設定
+LEFT JOIN gif_hcc_event_attendee hea
+    ON he.event_no = hea.event_no   -- 對應參加者名單
+LEFT JOIN gif_hcc_event_member_type hem
+    ON he.event_no = hem.event_no   -- 對應會員類型設定
+WHERE 1 = 1
+    -- 僅考慮目前時間仍在兌換期間的活動
+    AND e.exchange_start_date < LOCALTIMESTAMP
+    AND e.exchange_end_date >= LOCALTIMESTAMP
+    
+    -- 活動狀態為啟用中
+    AND e.event_status = 'USING'
+    
+    -- 僅供App參加的活動
+    AND he.only_app = 'Y'
+    
+    -- 指定的活動類別
+    AND he.hcc_event_type = :hccEventType
+    
+    -- 若活動不是開放所有會員，則需檢查使用者是否有被列入參加名單
+    AND (
+        he.all_member = 'Y'
+        OR (he.all_member = 'N' AND hea.app_id = :appId)
+    )
+    
+    -- 若活動是 CLUB_DEDUCT_POINT，則必須符合會員類型限制
+    AND (
+        he.hcc_event_type <> 'CLUB_DEDUCT_POINT'
+        OR (hem.member_type IN (:memberTypes))
+    );
+
+請求參數：
+參數名稱
+說明
+hccEventType
+活動類型識別，ex：NORMAL_DEDUCT_POINT
+memberTypes
+用戶所屬的會員等級（例如：SOGO_VIP, SOGO_VVIP）
+appId
+使用者在App中的唯一身份（App ID）
+
+
+活動必須是進行中的（狀態為 'USING' 且兌換期間內）
+活動必須為只限 App (only_app = 'Y')
+活動必須符合指定的類型 hcc_event_type
+若 all_member = 'Y' 表示所有會員皆可參加，否則需檢查參加者清單中是否存在此使用者 (app_id)
+若活動為 CLUB_DEDUCT_POINT 類型，則還需用戶的 member_type 符合活動設定
+
+=================================================
+const hccEventType = "NORMAL_DEDUCT_POINT";
+const memberTypes = ["SOGO_VIP", "SOGO_VVIP"];
+const appId = "A000111222";
+const now = new Date();
+
+db.events.aggregate([
+  // 🎯 Step 1：挑出目前進行中、狀態啟用的活動
+  {
+    $match: {
+      hccEventType: hccEventType,             // 活動類型
+      eventStatus: "USING",                   // 活動狀態
+      onlyApp: true,                          // 只限 App
+      startDate: { $lte: now },               // 起始時間在現在之前
+      endDate: { $gte: now },                 // 結束時間在現在之後
+      $or: [
+        { hccEventType: { $ne: "CLUB_DEDUCT_POINT" } },    // 非 club 類活動
+        { memberTypes: { $in: memberTypes } }              // 或符合會員別
+      ]
+    }
+  },
+
+  // 🔗 Step 2：Join event_attendees（subquery 关联一位 appId）
+  {
+    $lookup: {
+      from: "event_attendees",
+      let: { eventNo: "$eventNo" },
+      pipeline: [
+        {
+          $match: {
+            $expr: {
+              $and: [
+                { $eq: ["$eventNo", "$$eventNo"] },
+                { $eq: ["$appId", appId] }              // 判斷參與者是否存在
+              ]
+            }
+          }
+        },
+        { $limit: 1 }  // 最快取一筆即可
+      ],
+      as: "matchedAttendee"
+    }
+  },
+
+  // ✅ Step 3：過濾：允許參加的情況
+  {
+    $match: {
+      $or: [
+        { allMember: true },                               // 開放所有人參加
+        { "matchedAttendee.0": { $exists: true } }         // 或參加者有在名單中
+      ]
+    }
+  },
+
+  // ✅ Step 4：是否有符合條件的活動
+  {
+    $limit: 1
+  },
+
+  // 🔚 Step 5：轉換成 hasEvent: true 結果格式
+  {
+    $project: {
+      _id: 0,
+      hasEvent: { $literal: true }
+    }
+  }
+]).toArray()
