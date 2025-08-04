@@ -24,32 +24,43 @@ from psycopg2.extras import DictCursor
 from pymongo import MongoClient, UpdateOne
 from dotenv import load_dotenv
 
-# ========== 載入 .env 配置 ==========
-load_dotenv()
-
-# 讀取目前環境，預設為 dev
+# ========== 根據 ENV 載入相應的 .env 文件 ==========
 ENV = os.getenv("ENV", "dev")
+env_file = f".env.{ENV}"
+if os.path.exists(env_file):
+    load_dotenv(env_file)
+else:
+    print(f"警告：找不到 {env_file}，請確認該環境的配置文件存在")
+    load_dotenv()
 
 POSTGRESQL_CONFIGS = {
     "dev": {
-        "host": os.getenv("PG_HOST_DEV"),
-        "port": int(os.getenv("PG_PORT_DEV", 5432)),
-        "user": os.getenv("PG_USER_DEV"),
-        "password": os.getenv("PG_PASSWORD_DEV"),
-        "dbname": os.getenv("PG_DBNAME_DEV"),
+        "host": os.getenv("PG_HOST"),
+        "port": int(os.getenv("PG_PORT", 5432)),
+        "user": os.getenv("PG_USER"),
+        "password": os.getenv("PG_PASSWORD"),
+        "dbname": os.getenv("PG_DBNAME"),
+    },
+    "uat": {
+        "host": os.getenv("PG_HOST"),
+        "port": int(os.getenv("PG_PORT", 5432)),
+        "user": os.getenv("PG_USER"),
+        "password": os.getenv("PG_PASSWORD"),
+        "dbname": os.getenv("PG_DBNAME"),
     },
     "prod": {
-        "host": os.getenv("PG_HOST_PROD"),
-        "port": int(os.getenv("PG_PORT_PROD", 5432)),
-        "user": os.getenv("PG_USER_PROD"),
-        "password": os.getenv("PG_PASSWORD_PROD"),
-        "dbname": os.getenv("PG_DBNAME_PROD"),
+        "host": os.getenv("PG_HOST"),
+        "port": int(os.getenv("PG_PORT", 5432)),
+        "user": os.getenv("PG_USER"),
+        "password": os.getenv("PG_PASSWORD"),
+        "dbname": os.getenv("PG_DBNAME"),
     }
 }
 
 MONGO_URIS = {
-    "dev": os.getenv("MONGO_URI_DEV"),
-    "prod": os.getenv("MONGO_URI_PROD"),
+    "dev": os.getenv("MONGO_URI"),
+    "uat": os.getenv("MONGO_URI"),
+    "prod": os.getenv("MONGO_URI"),
 }
 
 BATCH_SIZE = int(os.getenv("BATCH_SIZE", "500"))
@@ -290,21 +301,17 @@ def migrate_window(window: dict, window_name: str):
 
         logger.info(f"{window_name} 批次大小：{len(batch_event_nos)}")
 
-        # 串行處理，等待每筆完成再處理下一筆
         for eno in batch_event_nos:
             success = migrate_single_event(eno)
             if success:
                 migrated += 1
                 last_id = eno
-                # 更新最後事件時間作斷點
                 pg_cursor.execute(f"SELECT exchange_start_date FROM {SCHEMA}.gif_event WHERE event_no = %s", (eno,))
                 row = pg_cursor.fetchone()
                 if row and row["exchange_start_date"]:
                     last_time = row["exchange_start_date"].isoformat()
                 else:
-                    # 發生問題時不更新 last_time，保留上次斷點
                     logger.warning(f"取event_no：{eno} 時間失敗，斷點時間不更新")
-                # 更新斷點
                 window["last_checkpoint_time"] = last_time
                 window["last_checkpoint_id"] = last_id
                 window["processed_count"] = migrated
@@ -342,8 +349,6 @@ def load_checkpoint():
 def save_checkpoint(data):
     with open(CHECKPOINT_FILE, "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False, indent=2)
-
-# 命令行管理及對應操作
 
 def command_full_sync(end_time=None):
     if end_time is None:
@@ -490,7 +495,6 @@ def main():
     global cp_data
     cp_data = load_checkpoint()
 
-    # 只有在執行遷移會初始化日誌及DB連線
     if args.full_sync or args.incremental or args.correction or args.resume:
         init_logger()
         init_db_conn()
@@ -512,7 +516,6 @@ def main():
     else:
         print("請指定有效參數，使用 --help 查看說明")
 
-    # 輸出日誌路徑方便查看
     if LOG_FILE:
         print("\n🔍 本次遷移日誌文件:")
         print(os.path.abspath(LOG_FILE))
