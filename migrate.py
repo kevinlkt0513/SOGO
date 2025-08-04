@@ -22,18 +22,34 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 import psycopg2
 from psycopg2.extras import DictCursor
 from pymongo import MongoClient, UpdateOne
+from dotenv import load_dotenv
 
-# ========== 環境與配置 ==========
+# ========== 載入 .env 配置 ==========
+load_dotenv()
+
+# 讀取目前環境，預設為 dev
 ENV = os.getenv("ENV", "dev")
 
 POSTGRESQL_CONFIGS = {
-    "dev": {"host": "localhost", "port": 5432, "user": "devuser", "password": "devpassword", "dbname": "sogo"},
-    "prod": {}
+    "dev": {
+        "host": os.getenv("PG_HOST_DEV"),
+        "port": int(os.getenv("PG_PORT_DEV", 5432)),
+        "user": os.getenv("PG_USER_DEV"),
+        "password": os.getenv("PG_PASSWORD_DEV"),
+        "dbname": os.getenv("PG_DBNAME_DEV"),
+    },
+    "prod": {
+        "host": os.getenv("PG_HOST_PROD"),
+        "port": int(os.getenv("PG_PORT_PROD", 5432)),
+        "user": os.getenv("PG_USER_PROD"),
+        "password": os.getenv("PG_PASSWORD_PROD"),
+        "dbname": os.getenv("PG_DBNAME_PROD"),
+    }
 }
 
 MONGO_URIS = {
-    "dev": "mongodb+srv://new-user-01:new-user-01@clusterm10.4y4hg.mongodb.net/?retryWrites=true&w=majority&appName=ClusterM10",
-    "prod": ""
+    "dev": os.getenv("MONGO_URI_DEV"),
+    "prod": os.getenv("MONGO_URI_PROD"),
 }
 
 BATCH_SIZE = int(os.getenv("BATCH_SIZE", "500"))
@@ -46,7 +62,6 @@ MONGO_URI = MONGO_URIS[ENV]
 CHECKPOINT_FILE = "migration_checkpoint.json"
 LOG_DIR = "logs"
 
-# 日誌全局暫存變數，延遲初始化以避免無參數執行產生空日誌
 LOG_FILE = None
 logger = None
 
@@ -62,14 +77,12 @@ def init_logger():
     )
     logger = logging.getLogger()
 
-
 # ========= 全局資料庫連線 ==========
 pg_conn = None
 pg_cursor = None
 mongo_client = None
 col_events = None
 col_attendees = None
-
 
 def init_db_conn():
     """ 初始化 PostgreSQL 與 MongoDB 連線 """
@@ -97,7 +110,6 @@ def init_db_conn():
         logger.error(f"無法連接 MongoDB：{e}")
         sys.exit(1)
 
-
 BRANCH_ORDER = {
     "BRANCH_TAIWAN": "全台", "BRANCH_TAIPEI": "台北店", "BRANCH_JS": "忠孝館",
     "BRANCH_FS": "復興館", "BRANCH_DH": "敦化館", "BRANCH_TM": "天母店",
@@ -105,7 +117,6 @@ BRANCH_ORDER = {
     "BRANCH_GC": "Garden City", "BRANCH_GCA": "Garden City-A區",
     "BRANCH_GCB": "Garden City-B區", "BRANCH_GCC": "Garden City-C區", "BRANCH_GCD": "Garden City-D區"
 }
-
 
 # ========= 主表與子表數據擴充 ==========
 def enrich_event(event):
@@ -148,7 +159,6 @@ def enrich_event(event):
 
     return event
 
-
 # ========= 批次抓取活動event_no ==========
 def fetch_events_batch(start_time, end_time, last_checkpoint_time=None, last_checkpoint_id=None, batch_size=100):
     if isinstance(start_time, str):
@@ -181,7 +191,6 @@ def fetch_events_batch(start_time, end_time, last_checkpoint_time=None, last_che
     rows = pg_cursor.fetchall()
     return [row["event_no"] for row in rows]
 
-
 def fetch_event(event_no):
     sql = f"""
         SELECT he.event_no, he.event_memo, he.branch AS eventBranchId, he.prize_coupon_json,
@@ -199,7 +208,6 @@ def fetch_event(event_no):
     keys = ["eventNo", "eventMemo", "eventBranchId", "prizeCouponJson", "giftAttentionUrl", "onlyApp", "allMember", "hccEventType",
             "name", "eventStatus", "startDate", "endDate", "giftInforUrl"]
     return dict(zip(keys, row))
-
 
 def migrate_attendees(event_no):
     try:
@@ -226,7 +234,6 @@ def migrate_attendees(event_no):
         logger.warning(f"參與者資料寫入失敗，事件 {event_no}，錯誤：{e}")
         return 0
 
-
 def migrate_single_event(event_no):
     try:
         event = fetch_event(event_no)
@@ -242,7 +249,6 @@ def migrate_single_event(event_no):
         logger.error(f"活動 {event_no} 遷移失敗，錯誤：{e}")
         return False
 
-
 def count_pg_events_in_window(start, end):
     if isinstance(start, str):
         start = datetime.datetime.fromisoformat(start)
@@ -251,7 +257,6 @@ def count_pg_events_in_window(start, end):
     sql = f"SELECT COUNT(*) FROM {SCHEMA}.gif_hcc_event he JOIN {SCHEMA}.gif_event e ON he.event_no = e.event_no WHERE e.exchange_start_date >= %s AND e.exchange_start_date < %s"
     pg_cursor.execute(sql, (start, end))
     return pg_cursor.fetchone()[0]
-
 
 def migrate_window(window: dict, window_name: str):
     logger.info(f"處理窗口 {window_name}：{window['start']} ~ {window['end']} 狀態：{window['status']}")
@@ -284,8 +289,8 @@ def migrate_window(window: dict, window_name: str):
             break
 
         logger.info(f"{window_name} 批次大小：{len(batch_event_nos)}")
-        
-        # ---- 串行處理，等待每筆完成再處理下一筆 ----
+
+        # 串行處理，等待每筆完成再處理下一筆
         for eno in batch_event_nos:
             success = migrate_single_event(eno)
             if success:
@@ -334,11 +339,9 @@ def load_checkpoint():
             return json.load(f)
     return {"base_windows": [], "correction_windows": []}
 
-
 def save_checkpoint(data):
     with open(CHECKPOINT_FILE, "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False, indent=2)
-
 
 # 命令行管理及對應操作
 
@@ -374,7 +377,6 @@ def command_full_sync(end_time=None):
             total += migrate_window(w, f"base_windows[{idx}]")
     print(f"全量同步完成，遷移筆數: {total}")
 
-
 def command_incremental(end_time=None):
     if end_time is None:
         end_time = datetime.datetime.now().isoformat()
@@ -389,7 +391,6 @@ def command_incremental(end_time=None):
             total += migrate_window(w, f"base_windows[{idx}]")
     save_checkpoint(cp_data)
     print(f"增量同步完成，遷移筆數: {total}")
-
 
 def command_correction(start_time, end_time, force=False):
     global cp_data
@@ -416,7 +417,6 @@ def command_correction(start_time, end_time, force=False):
             total += migrate_window(w, f"correction_windows[{idx}]")
     print(f"補寫同步完成，遷移筆數: {total}")
 
-
 def command_resume():
     global cp_data
     total = 0
@@ -426,11 +426,9 @@ def command_resume():
                 total += migrate_window(w, f"{wlist}[{idx}]")
     print(f"斷點恢復完成，遷移筆數: {total}")
 
-
 def command_show_status():
     global cp_data
     print(json.dumps(cp_data, ensure_ascii=False, indent=2))
-
 
 def command_reset():
     confirm = input("警告：重置斷點將清除所有遷移進度且無法恢復，請輸入 Y 確認：")
@@ -443,7 +441,6 @@ def command_reset():
         print("重置完成")
     else:
         print("操作已取消")
-
 
 def command_gen_report():
     global cp_data
@@ -458,7 +455,6 @@ def command_gen_report():
             print(f"  執行者: {w.get('owner')}")
             print(f"  最後更新時間: {w.get('last_update_time')}")
     print("============================")
-
 
 def parse_args():
     parser = argparse.ArgumentParser(description="PostgreSQL → MongoDB 活動資料遷移工具")
@@ -488,7 +484,6 @@ def parse_args():
         parser.error("--force 必須和 --correction 一起使用")
 
     return args
-
 
 def main():
     args = parse_args()
@@ -522,7 +517,6 @@ def main():
         print("\n🔍 本次遷移日誌文件:")
         print(os.path.abspath(LOG_FILE))
         print(f"使用命令查看日誌：tail -f {os.path.abspath(LOG_FILE)}\n")
-
 
 if __name__ == "__main__":
     main()
