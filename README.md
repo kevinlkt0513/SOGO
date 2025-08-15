@@ -2,7 +2,7 @@
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
-一個功能強大且可靠的 Python 工具，專為將 PostgreSQL 中的業務資料遷移並持續同步至 MongoDB 而設計。此工具不僅支援全量、增量、斷點續傳等多種模式，更內建了符合特定業務規則的「主表驅動」遷移邏輯。
+數據遷移 Python 工具，專為將 PostgreSQL 中的業務資料遷移並持續同步至 MongoDB 而設計。此工具不僅支援全量、增量、斷點續傳等多種模式，更內建了符合特定業務規則的「主表驅動」遷移邏輯。
 
 ---
 
