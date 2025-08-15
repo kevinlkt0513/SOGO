@@ -49,7 +49,16 @@ LOG_DIR = "logs"
 LOG_FILE = None
 logger = None
 
-# 定義多表設定：PG資料表 | 全量時間欄位(add_date) | 斷點時間欄位(mod_date) | 主鍵欄位 | MongoDB 集合名稱 | 嵌入陣列欄位(可選)
+# --- 新增這個全域統計變數 ---
+MIGRATION_STATS = {
+    "tables": {},
+    "total_pg_records": 0,
+    "total_inserted": 0,
+    "total_updated": 0,
+    "verification_results": []
+}
+
+# 定義多表設定：PG資料表 | 全量時間欄位(add_date) | 斷點時間欄位(mod_date) | 主鍵欄位 | MongoDB 集合名稱 | 嵌入陣列欄位(可選) | 驗證模式 
 TABLES_CONFIG = {
     "events": {
         "pg_table": "gif_event",
@@ -57,6 +66,7 @@ TABLES_CONFIG = {
         "mod_date_field": "mod_date",
         "id_field": "event_no",
         "mongo_collection": "events",
+        "verification_mode": "primary_count"  # 這是主計數來源
     },
     "hcc_events": {
         "pg_table": "gif_hcc_event",
@@ -64,6 +74,7 @@ TABLES_CONFIG = {
         "mod_date_field": "mod_date",
         "id_field": "event_no",
         "mongo_collection": "events",
+        "verification_mode": "merge_source"   # 這是合併資料來源
     },
     "attendees": {
         "pg_table": "gif_hcc_event_attendee",
@@ -71,6 +82,7 @@ TABLES_CONFIG = {
         "mod_date_field": "mod_date",
         "id_field": "id",
         "mongo_collection": "event_attendees",
+        "verification_mode": "primary_count"  # 這是一對一的，所以也是主計數
     },
     "coupon_burui": {
         "pg_table": "gif_event_coupon_burui",
@@ -79,6 +91,7 @@ TABLES_CONFIG = {
         "id_field": "id",
         "mongo_collection": "events",
         "embed_array_field": "usingBranchIds",
+        "verification_mode": "embed_array"    # 這是嵌入陣列
     },
     "coupon_setting": {
         "pg_table": "gif_event_coupon_setting",
@@ -87,6 +100,7 @@ TABLES_CONFIG = {
         "id_field": "coupon_setting_no",
         "mongo_collection": "events",
         "embed_array_field": "prizeCouponJson",
+        "verification_mode": "embed_array"    # 這是嵌入陣列
     },
     "member_types": {
         "pg_table": "gif_hcc_event_member_type",
@@ -95,33 +109,9 @@ TABLES_CONFIG = {
         "id_field": "id",
         "mongo_collection": "events",
         "embed_array_field": "memberTypes",
+        "verification_mode": "embed_array"    # 這是嵌入陣列
     },
 }
-
-# ===== 全域變數：儲存有效的 event_no 白名單 =====
-VALID_EVENT_NOS = set()
-
-def load_valid_event_nos(conn):
-    """
-    從主表 gif_hcc_event 載入所有有效的 event_no，作為遷移的白名單。
-    """
-    global VALID_EVENT_NOS
-    logger.info("正在從主表 gif_hcc_event 載入有效的 event_no 白名單...")
-    
-    # 確保只執行一次
-    if VALID_EVENT_NOS:
-        logger.info("白名單已載入，跳過。")
-        return
-
-    try:
-        with conn.cursor() as cur:
-            cur.execute(f"SELECT DISTINCT event_no FROM {SCHEMA}.gif_hcc_event")
-            rows = cur.fetchall()
-            VALID_EVENT_NOS = {row['event_no'] for row in rows}
-            logger.info(f"成功載入 {len(VALID_EVENT_NOS)} 個有效的 event_no 到白名單。")
-    except Exception as e:
-        logger.error(f"載入 event_no 白名單失敗: {e}")
-        sys.exit(1)
 
 def init_logger(task_name="general"):
     """
@@ -244,20 +234,18 @@ def fetch_batch(table_key, start_time, end_time,
                 batch_size=100, mode="incremental"):
     """
     批次擷取指定表於時間視窗內之資料
-    - ★★★ 新邏輯：所有查詢都必須過濾 event_no，確保其存在於 VALID_EVENT_NOS 白名單中 ★★★
+    - ★★★ 恢復邏輯：不再使用白名單過濾 ★★★
     """
     conf = TABLES_CONFIG[table_key]
     
-    valid_event_nos_list = list(VALID_EVENT_NOS)
-    
-    event_no_column_alias = "t.event_no"
     join_clause = ""
+    base_sql_select = f"SELECT t.* FROM {SCHEMA}.{conf['pg_table']} t"
     
     if table_key == "coupon_burui":
         join_clause = f"JOIN {SCHEMA}.gif_event_coupon_setting s ON t.coupon_setting_no = s.coupon_setting_no"
-        event_no_column_alias = "s.event_no"
-    
-    # --- 修正點：明確指定主表 't' 的欄位 ---
+        base_sql_select = f"SELECT t.*, s.event_no FROM {SCHEMA}.{conf['pg_table']} t"
+
+    # 明確指定主表 't' 的欄位，避免 JOIN 時的欄位歧義
     date_field_str = conf['add_date_field']
     mod_date_field_str = conf['mod_date_field']
     id_field_str = conf['id_field']
@@ -265,10 +253,7 @@ def fetch_batch(table_key, start_time, end_time,
     date_field = f"t.{date_field_str}" if mode == "full" else f"COALESCE(t.{mod_date_field_str}, t.{date_field_str})"
     order_by_clause = f"ORDER BY {date_field}, t.{id_field_str}"
     
-    base_sql = f"SELECT t.* FROM {SCHEMA}.{conf['pg_table']} t {join_clause}"
-    
-    if table_key == "coupon_burui":
-        base_sql = f"SELECT t.*, s.event_no FROM {SCHEMA}.{conf['pg_table']} t {join_clause}"
+    base_sql = f"{base_sql_select} {join_clause}"
     
     params = []
     where_clauses = []
@@ -277,25 +262,17 @@ def fetch_batch(table_key, start_time, end_time,
         where_clauses.append(f"{date_field} >= %s AND {date_field} < %s")
         params.extend([start_time, end_time])
     else:
-        # --- 修正點：明確指定 id 欄位來自 't' 表 ---
         id_field_with_alias = f"t.{id_field_str}"
         where_clauses.append(f"({date_field} > %s OR ({date_field} = %s AND {id_field_with_alias} > %s))")
         params.extend([last_checkpoint_time, last_checkpoint_time, last_checkpoint_id])
         where_clauses.append(f"{date_field} >= %s AND {date_field} < %s")
         params.extend([start_time, end_time])
         
-    where_clauses.append(f"{event_no_column_alias} = ANY(%s)")
-    params.append(valid_event_nos_list)
-
+    # 組成最終 SQL
     sql = f"{base_sql} WHERE {' AND '.join(where_clauses)} {order_by_clause} LIMIT %s"
     params.append(batch_size)
-
-    # 為了日誌清晰，從 params 複製一份來顯示，避免修改原始 params
-    log_params = list(params)
-    if valid_event_nos_list:
-        log_params[log_params.index(valid_event_nos_list)] = f"[...{len(valid_event_nos_list)} event_nos...]"
         
-    logger.info(f"[SQL-{table_key}] {sql.replace(chr(10), ' ')} params {log_params}")
+    logger.info(f"[SQL-{table_key}] {sql.replace(chr(10), ' ')} params {params}")
     pg_cursor.execute(sql, params)
     return pg_cursor.fetchall()
 
@@ -351,9 +328,14 @@ def upsert_batch(table_key, rows):
             requests.append(UpdateOne(filter_cond, {"$set": doc}, upsert=True))
 
     if not requests:
-        return 0
+        # 建立一個模擬的 result 物件，以便呼叫端統一處理
+        class EmptyResult:
+            upserted_count = 0
+            modified_count = 0
+        return EmptyResult()
+    
     result = mongo_dbs[table_key].bulk_write(requests, ordered=False)
-    return result.upserted_count
+    return result
 
 def update_checkpoint(table_key, last_time, last_id, processed_count, window=None, status=None):
     """
@@ -402,7 +384,28 @@ def migrate_table_window(table_key, window, mode="incremental"):
             break
 
         try:
-            upsert_batch(table_key, rows)
+            result = upsert_batch(table_key, rows)
+
+            # 初始化表格的統計數據
+            table_stats = MIGRATION_STATS["tables"].setdefault(table_key, {
+                "pg_records": 0, "inserted": 0, "updated": 0
+            })
+
+            # 更新統計數據
+            processed_this_batch = len(rows)
+            inserted_this_batch = result.upserted_count
+            # upsert 更新時，modified_count 會增加
+            # 嵌入陣列 ($addToSet) 也算是一種更新
+            updated_this_batch = result.modified_count if "embed_array_field" not in TABLES_CONFIG[table_key] else processed_this_batch
+
+            table_stats["pg_records"] += processed_this_batch
+            table_stats["inserted"] += inserted_this_batch
+            table_stats["updated"] += updated_this_batch
+            
+            MIGRATION_STATS["total_pg_records"] += processed_this_batch
+            MIGRATION_STATS["total_inserted"] += inserted_this_batch
+            MIGRATION_STATS["total_updated"] += updated_this_batch
+
             processed += len(rows)
 
             last_row = rows[-1]
@@ -489,54 +492,43 @@ def save_checkpoint(data):
 
 def verify_consistency():
     """
-    對各表做全量一致性檢驗；
-    ★★★ 新邏輯：PG 端計數時，必須過濾 event_no 白名單 ★★★
+    對各表做全量一致性檢驗，並將結果存儲到全域統計中。
     """
-    valid_event_nos_list = list(VALID_EVENT_NOS)
-
+    global MIGRATION_STATS
+    all_ok = True
+    
     for key, conf in TABLES_CONFIG.items():
-        # PG 端計數 (加入白名單過濾)
-        pg_count_sql = ""
-        params = [valid_event_nos_list]
-        
-        # 根據不同表格結構，產生不同的計數 SQL
-        if key == "coupon_burui":
-            pg_count_sql = f"""
-                SELECT COUNT(t.*) FROM {SCHEMA}.{conf['pg_table']} t
-                JOIN {SCHEMA}.gif_event_coupon_setting s ON t.coupon_setting_no = s.coupon_setting_no
-                WHERE s.event_no = ANY(%s)
-            """
-        elif key in ["events", "hcc_events", "attendees", "member_types", "coupon_setting"]:
-            # 對於 gif_event，我們只計算那些 event_no 存在於主表 hcc_event 中的數量
-            pg_count_sql = f"SELECT COUNT(*) FROM {SCHEMA}.{conf['pg_table']} WHERE event_no = ANY(%s)"
-        else:
-            logger.warning(f"一致性統計未針對 {key} 設定特別的 SQL，可能不準確。")
-            continue
-
-        pg_cursor.execute(pg_count_sql, params)
+        mode = conf.get("verification_mode", "primary_count")
+        pg_table_name = conf['pg_table']
+        pg_cursor.execute(f"SELECT COUNT(*) FROM {SCHEMA}.{pg_table_name}")
         pg_count = pg_cursor.fetchone()[0]
 
-        # MG 端計數
-        mongo_collection = mongo_dbs[key]
-        if "embed_array_field" in conf:
-            # 嵌入欄位的計數邏輯保持不變，因為寫入時已經過濾
+        result_str = ""
+        is_consistent = True
+
+        if mode == "merge_source":
+            result_str = f"資料合併來源 {pg_table_name}: PG 端提供 {pg_count} 筆資料。"
+            MIGRATION_STATS["verification_results"].append(f"INFO: {result_str}")
+            continue
+
+        elif mode == "embed_array":
             arr_field = conf["embed_array_field"]
-            # 這裡的查詢也應該加上 event_no 的過濾
-            mongo_count = sum(len(doc.get(arr_field, [])) for doc in mongo_dbs["events"].find(
-                {"event_no": {"$in": valid_event_nos_list}},
-                {arr_field: 1}
-            ))
+            mongo_count = sum(len(doc.get(arr_field, [])) for doc in mongo_dbs["events"].find({}, {arr_field: 1}))
+            result_str = f"嵌入陣列 {pg_table_name}: PG行數={pg_count}, MG元素={mongo_count}"
+            is_consistent = (pg_count == mongo_count)
+
+        elif mode == "primary_count":
+            mongo_count = mongo_dbs[key].count_documents({})
+            result_str = f"主計數 {pg_table_name}: PG={pg_count}, MG={mongo_count}"
+            is_consistent = (pg_count == mongo_count)
+
+        if is_consistent:
+            MIGRATION_STATS["verification_results"].append(f"✅ PASS: {result_str}")
         else:
-            # 對於 events 集合，其總數應該等於白名單的數量
-            if conf["mongo_collection"] == "events":
-                mongo_count = mongo_dbs[key].count_documents({"event_no": {"$in": valid_event_nos_list}})
-            else:
-                 mongo_count = mongo_dbs[key].count_documents({})
+            MIGRATION_STATS["verification_results"].append(f"❌ FAIL: {result_str}")
+            all_ok = False
 
-
-        logger.info(f"一致性統計 {conf['pg_table']}: PG={pg_count}, MG={mongo_count}")
-        if pg_count != mongo_count:
-            logger.warning(f"一致性不符 {conf['pg_table']} PG={pg_count} vs MG={mongo_count}，需重新同步")
+    return all_ok
 
 def command_full_sync(end_time=None):
     """
@@ -693,58 +685,103 @@ def parse_args():
         args.end = datetime.datetime.now().isoformat()
     return args
 
+def log_summary_report(start_time, end_time, task_name):
+    """
+    在腳本執行結束時，打印格式化的總結報告。
+    """
+    duration = end_time - start_time
+    total_seconds = duration.total_seconds()
+    
+    # 計算總耗時 (時/分/秒)
+    hours, remainder = divmod(total_seconds, 3600)
+    minutes, seconds = divmod(remainder, 60)
+    duration_str = f"{int(hours)} 小時 {int(minutes)} 分鐘 {seconds:.2f} 秒"
+    
+    # 計算吞吐量
+    total_records = MIGRATION_STATS['total_pg_records']
+    throughput = (total_records / total_seconds) if total_seconds > 0 else 0
+
+    # 判斷任務狀態
+    has_failures = any("FAIL" in result for result in MIGRATION_STATS["verification_results"])
+    status_str = "失敗" if has_failures else "成功完成"
+    if not has_failures and task_name not in ["show-status", "reset"]:
+        status_str += " (所有校驗均通過)"
+
+    # 開始打印報告
+    logger.info("=" * 60)
+    logger.info("========== [ 遷移任務總結報告 (Migration Summary) ] ==========")
+    logger.info("=" * 60)
+    logger.info("")
+    logger.info("[ 總體概覽 (Overall) ]")
+    logger.info(f"  - 任務狀態:           {status_str}")
+    logger.info(f"  - 任務名稱:           {task_name}")
+    logger.info(f"  - 開始時間:           {start_time.strftime('%Y-%m-%d %H:%M:%S')}")
+    logger.info(f"  - 結束時間:           {end_time.strftime('%Y-%m-%d %H:%M:%S')}")
+    logger.info(f"  - 總耗時:             {duration_str}")
+    logger.info(f"  - 總處理 PostgreSQL 紀錄數: {total_records:,} 筆")
+    logger.info(f"  - 平均吞吐量:           {throughput:.1f} 筆/秒")
+    logger.info("")
+    
+    logger.info("[ 分表處理詳情 (Per-Table Details) ]")
+    if not MIGRATION_STATS["tables"]:
+        logger.info("  - 本次任務未處理任何資料。")
+    else:
+        for key, stats in MIGRATION_STATS["tables"].items():
+            pg_table_name = TABLES_CONFIG[key]['pg_table']
+            logger.info(f"  - {pg_table_name} ({key}):")
+            logger.info(f"    > PG 來源: {stats['pg_records']:,} | Mongo 新增: {stats['inserted']:,} | Mongo 更新: {stats['updated']:,}")
+    logger.info("")
+
+    logger.info("[ 資料一致性校驗 (Data Consistency Verification) ]")
+    if not MIGRATION_STATS["verification_results"]:
+         logger.info("  - 本次任務未執行資料校驗。")
+    else:
+        for result in MIGRATION_STATS["verification_results"]:
+            logger.info(f"  - {result}")
+    logger.info("")
+    logger.info("=" * 25 + " [ 報告結束 ] " + "=" * 25)
+
 def main():
     global cp_data
+    start_time = datetime.datetime.now() # <--- 記錄開始時間
     args = parse_args()
-
-    # --- 核心修改點：根據參數確定任務名稱 ---
+    
     task_name = "unknown"
-    if args.full_sync:
-        task_name = "full-sync"
-    elif args.incremental:
-        task_name = "incremental"
-    elif args.correction:
-        task_name = f"correction-{args.correction[0]}" # 例如 correction-attendees
-    elif args.resume:
-        task_name = "resume"
-    elif args.show_status:
-        task_name = "show-status"
-    elif args.reset:
-        task_name = "reset"
+    if args.full_sync: task_name = "full-sync"
+    elif args.incremental: task_name = "incremental"
+    elif args.correction: task_name = f"correction-{args.correction[0]}"
+    elif args.resume: task_name = "resume"
+    elif args.show_status: task_name = "show-status"
+    elif args.reset: task_name = "reset"
 
-    # 使用新的任務名稱來初始化日誌
     init_logger(task_name=task_name)
     
-    # 後續邏輯保持不變
+    logger.info(f"===== 開始執行遷移任務: {task_name} =====")
+    
     init_db_conn()
-    load_valid_event_nos(pg_conn)
     cp_data = load_checkpoint()
 
-    if args.full_sync:
-        command_full_sync(end_time=args.end)
-    elif args.incremental:
-        command_incremental(end_time=args.end)
+    if args.full_sync: command_full_sync(end_time=args.end)
+    elif args.incremental: command_incremental(end_time=args.end)
     elif args.correction:
         table_key, start, end = args.correction
         if table_key not in TABLES_CONFIG:
             print(f"未知的 table: {table_key}")
             sys.exit(1)
         command_correction(table_key, start, end)
-    elif args.resume:
-        command_resume()
-    elif args.show_status:
-        command_show_status()
-    elif args.reset:
-        command_reset()
-    else:
-        print("請指定有效參數，使用 --help 查看說明")
+    elif args.resume: command_resume()
+    elif args.show_status: command_show_status()
+    elif args.reset: command_reset()
+    else: print("請指定有效參數，使用 --help 查看說明")
 
-    # 對於不會進行資料比對的任務，可以跳過驗證
     if task_name not in ["show-status", "reset"]:
         verify_consistency()
 
+    end_time = datetime.datetime.now() # <--- 記錄結束時間
+    log_summary_report(start_time, end_time, task_name) # <--- 呼叫報告函式
+
     if LOG_FILE:
-        print(f"\n日誌檔案：{os.path.abspath(LOG_FILE)}，可用 tail -f 查看")
+        print(f"\n日誌檔案：{os.path.abspath(LOG_FILE)}")
 
 if __name__ == "__main__":
     main()
