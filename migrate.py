@@ -98,18 +98,52 @@ TABLES_CONFIG = {
     },
 }
 
-def init_logger(mode=None, window_start=None, window_end=None):
+# ===== 全域變數：儲存有效的 event_no 白名單 =====
+VALID_EVENT_NOS = set()
+
+def load_valid_event_nos(conn):
     """
-    初始化日誌系統，根據同步模式與視窗生成唯一日誌檔名
+    從主表 gif_hcc_event 載入所有有效的 event_no，作為遷移的白名單。
+    """
+    global VALID_EVENT_NOS
+    logger.info("正在從主表 gif_hcc_event 載入有效的 event_no 白名單...")
+    
+    # 確保只執行一次
+    if VALID_EVENT_NOS:
+        logger.info("白名單已載入，跳過。")
+        return
+
+    try:
+        with conn.cursor() as cur:
+            cur.execute(f"SELECT DISTINCT event_no FROM {SCHEMA}.gif_hcc_event")
+            rows = cur.fetchall()
+            VALID_EVENT_NOS = {row['event_no'] for row in rows}
+            logger.info(f"成功載入 {len(VALID_EVENT_NOS)} 個有效的 event_no 到白名單。")
+    except Exception as e:
+        logger.error(f"載入 event_no 白名單失敗: {e}")
+        sys.exit(1)
+
+def init_logger(task_name="general"):
+    """
+    初始化日誌系統，根據任務名稱和時間戳生成易於管理的日誌檔名。
+    新格式: {YYYY-MM-DD}_{HHMMSS}_{任務名稱}_{簡短主機名}_{PID}.log
     """
     global LOG_FILE, logger
     os.makedirs(LOG_DIR, exist_ok=True)
-    dt_now = datetime.datetime.now().strftime("%Y%m%dT%H%M%S")
-    mode_str = mode if mode else "sync"
-    ws_str = window_start.replace(":", "").replace("-", "") if window_start else "start"
-    we_str = window_end.replace(":", "").replace("-", "") if window_end else "end"
-    instance = os.uname().nodename
-    LOG_FILE = os.path.join(LOG_DIR, f"sync_{mode_str}_window_{ws_str}_{we_str}_{instance}_{dt_now}.log")
+    
+    # 獲取檔名組件
+    timestamp = datetime.datetime.now().strftime("%Y-%m-%d_%H%M%S")
+    short_hostname = os.uname().nodename.split('.')[0]
+    pid = os.getpid()
+    
+    # 組成新檔名
+    log_filename = f"{timestamp}_{task_name}_{short_hostname}_{pid}.log"
+    LOG_FILE = os.path.join(LOG_DIR, log_filename)
+    
+    # 移除舊的 handler，避免日誌重複輸出
+    if logging.getLogger().hasHandlers():
+        logging.getLogger().handlers.clear()
+        
     logging.basicConfig(
         filename=LOG_FILE,
         level=logging.INFO,
@@ -210,165 +244,58 @@ def fetch_batch(table_key, start_time, end_time,
                 batch_size=100, mode="incremental"):
     """
     批次擷取指定表於時間視窗內之資料
-    - 支援全量/增量/斷點模式
-    - 增量模式下 mod_date 為 NULL 時回退到 add_date
-    - coupon_burui 特殊處理：JOIN coupon_setting 補 event_no
+    - ★★★ 新邏輯：所有查詢都必須過濾 event_no，確保其存在於 VALID_EVENT_NOS 白名單中 ★★★
     """
     conf = TABLES_CONFIG[table_key]
+    
+    valid_event_nos_list = list(VALID_EVENT_NOS)
+    
+    event_no_column_alias = "t.event_no"
+    join_clause = ""
+    
+    if table_key == "coupon_burui":
+        join_clause = f"JOIN {SCHEMA}.gif_event_coupon_setting s ON t.coupon_setting_no = s.coupon_setting_no"
+        event_no_column_alias = "s.event_no"
+    
+    # --- 修正點：明確指定主表 't' 的欄位 ---
+    date_field_str = conf['add_date_field']
+    mod_date_field_str = conf['mod_date_field']
+    id_field_str = conf['id_field']
 
-    # ========= 全量模式 =========
-    if mode == "full":
-        date_field = conf["add_date_field"]
+    date_field = f"t.{date_field_str}" if mode == "full" else f"COALESCE(t.{mod_date_field_str}, t.{date_field_str})"
+    order_by_clause = f"ORDER BY {date_field}, t.{id_field_str}"
+    
+    base_sql = f"SELECT t.* FROM {SCHEMA}.{conf['pg_table']} t {join_clause}"
+    
+    if table_key == "coupon_burui":
+        base_sql = f"SELECT t.*, s.event_no FROM {SCHEMA}.{conf['pg_table']} t {join_clause}"
+    
+    params = []
+    where_clauses = []
 
-        if table_key == "coupon_burui":
-            # 全量 + JOIN
-            if last_checkpoint_time is None or last_checkpoint_id is None:
-                sql = f"""
-                SELECT b.*, s.event_no
-                FROM {SCHEMA}.gif_event_coupon_burui b
-                JOIN {SCHEMA}.gif_event_coupon_setting s
-                  ON b.coupon_setting_no = s.coupon_setting_no
-                WHERE b.{date_field} >= %s AND b.{date_field} < %s
-                ORDER BY b.{date_field}, b.{conf['id_field']}
-                LIMIT %s
-                """
-                params = [start_time, end_time, batch_size]
-            else:
-                sql = f"""
-                SELECT b.*, s.event_no
-                FROM {SCHEMA}.gif_event_coupon_burui b
-                JOIN {SCHEMA}.gif_event_coupon_setting s
-                  ON b.coupon_setting_no = s.coupon_setting_no
-                WHERE
-                  (b.{date_field} > %s OR (
-                      b.{date_field} = %s AND b.{conf['id_field']} > %s
-                  ))
-                  AND b.{date_field} >= %s AND b.{date_field} < %s
-                ORDER BY b.{date_field}, b.{conf['id_field']}
-                LIMIT %s
-                """
-                params = [last_checkpoint_time, last_checkpoint_time, last_checkpoint_id,
-                          start_time, end_time, batch_size]
-        else:
-            # 普通表全量
-            if last_checkpoint_time is None or last_checkpoint_id is None:
-                sql = f"""
-                SELECT * FROM {SCHEMA}.{conf['pg_table']}
-                WHERE {date_field} >= %s AND {date_field} < %s
-                ORDER BY {date_field}, {conf['id_field']}
-                LIMIT %s
-                """
-                params = [start_time, end_time, batch_size]
-            else:
-                sql = f"""
-                SELECT * FROM {SCHEMA}.{conf['pg_table']}
-                WHERE
-                  ({date_field} > %s OR (
-                      {date_field} = %s AND {conf['id_field']} > %s
-                  ))
-                  AND {date_field} >= %s AND {date_field} < %s
-                ORDER BY {date_field}, {conf['id_field']}
-                LIMIT %s
-                """
-                params = [last_checkpoint_time, last_checkpoint_time, last_checkpoint_id,
-                          start_time, end_time, batch_size]
-
-    # ========= 增量模式（resume） =========
+    if last_checkpoint_time is None or last_checkpoint_id is None:
+        where_clauses.append(f"{date_field} >= %s AND {date_field} < %s")
+        params.extend([start_time, end_time])
     else:
-        mod_field = conf["mod_date_field"]
-        add_field = conf["add_date_field"]
+        # --- 修正點：明確指定 id 欄位來自 't' 表 ---
+        id_field_with_alias = f"t.{id_field_str}"
+        where_clauses.append(f"({date_field} > %s OR ({date_field} = %s AND {id_field_with_alias} > %s))")
+        params.extend([last_checkpoint_time, last_checkpoint_time, last_checkpoint_id])
+        where_clauses.append(f"{date_field} >= %s AND {date_field} < %s")
+        params.extend([start_time, end_time])
+        
+    where_clauses.append(f"{event_no_column_alias} = ANY(%s)")
+    params.append(valid_event_nos_list)
 
-        # coupon_burui 特殊处理：JOIN + 回退 add_date
-        if table_key == "coupon_burui":
-            if last_checkpoint_time is None or last_checkpoint_id is None:
-                sql = f"""
-                SELECT b.*, s.event_no
-                FROM {SCHEMA}.gif_event_coupon_burui b
-                JOIN {SCHEMA}.gif_event_coupon_setting s
-                  ON b.coupon_setting_no = s.coupon_setting_no
-                WHERE (
-                    (b.{mod_field} IS NOT NULL AND b.{mod_field} >= %s AND b.{mod_field} < %s)
-                    OR
-                    (b.{mod_field} IS NULL AND b.{add_field} >= %s AND b.{add_field} < %s)
-                )
-                ORDER BY COALESCE(b.{mod_field}, b.{add_field}), b.{conf['id_field']}
-                LIMIT %s
-                """
-                params = [start_time, end_time, start_time, end_time, batch_size]
-            else:
-                sql = f"""
-                SELECT b.*, s.event_no
-                FROM {SCHEMA}.gif_event_coupon_burui b
-                JOIN {SCHEMA}.gif_event_coupon_setting s
-                  ON b.coupon_setting_no = s.coupon_setting_no
-                WHERE (
-                    (b.{mod_field} IS NOT NULL AND (
-                        b.{mod_field} > %s OR (
-                            b.{mod_field} = %s AND b.{conf['id_field']} > %s
-                        )
-                    ) AND b.{mod_field} < %s)
-                    OR
-                    (b.{mod_field} IS NULL AND (
-                        b.{add_field} > %s OR (
-                            b.{add_field} = %s AND b.{conf['id_field']} > %s
-                        )
-                    ) AND b.{add_field} < %s)
-                )
-                AND COALESCE(b.{mod_field}, b.{add_field}) >= %s
-                AND COALESCE(b.{mod_field}, b.{add_field}) < %s
-                ORDER BY COALESCE(b.{mod_field}, b.{add_field}), b.{conf['id_field']}
-                LIMIT %s
-                """
-                params = [
-                    last_checkpoint_time, last_checkpoint_time, last_checkpoint_id, end_time,
-                    last_checkpoint_time, last_checkpoint_time, last_checkpoint_id, end_time,
-                    start_time, end_time,
-                    batch_size
-                ]
+    sql = f"{base_sql} WHERE {' AND '.join(where_clauses)} {order_by_clause} LIMIT %s"
+    params.append(batch_size)
 
-        # 普通表的增量查询
-        else:
-            if last_checkpoint_time is None or last_checkpoint_id is None:
-                sql = f"""
-                SELECT * FROM {SCHEMA}.{conf['pg_table']}
-                WHERE (
-                    ({mod_field} IS NOT NULL AND {mod_field} >= %s AND {mod_field} < %s)
-                    OR
-                    ({mod_field} IS NULL AND {add_field} >= %s AND {add_field} < %s)
-                )
-                ORDER BY COALESCE({mod_field}, {add_field}), {conf['id_field']}
-                LIMIT %s
-                """
-                params = [start_time, end_time, start_time, end_time, batch_size]
-            else:
-                sql = f"""
-                SELECT * FROM {SCHEMA}.{conf['pg_table']}
-                WHERE (
-                    ({mod_field} IS NOT NULL AND (
-                        {mod_field} > %s OR (
-                            {mod_field} = %s AND {conf['id_field']} > %s
-                        )
-                    ) AND {mod_field} < %s)
-                    OR
-                    ({mod_field} IS NULL AND (
-                        {add_field} > %s OR (
-                            {add_field} = %s AND {conf['id_field']} > %s
-                        )
-                    ) AND {add_field} < %s)
-                )
-                AND COALESCE({mod_field}, {add_field}) >= %s
-                AND COALESCE({mod_field}, {add_field}) < %s
-                ORDER BY COALESCE({mod_field}, {add_field}), {conf['id_field']}
-                LIMIT %s
-                """
-                params = [
-                    last_checkpoint_time, last_checkpoint_time, last_checkpoint_id, end_time,
-                    last_checkpoint_time, last_checkpoint_time, last_checkpoint_id, end_time,
-                    start_time, end_time,
-                    batch_size
-                ]
-
-    logger.info(f"[SQL-{table_key}] {sql.replace(chr(10), ' ')} params {params}")
+    # 為了日誌清晰，從 params 複製一份來顯示，避免修改原始 params
+    log_params = list(params)
+    if valid_event_nos_list:
+        log_params[log_params.index(valid_event_nos_list)] = f"[...{len(valid_event_nos_list)} event_nos...]"
+        
+    logger.info(f"[SQL-{table_key}] {sql.replace(chr(10), ' ')} params {log_params}")
     pg_cursor.execute(sql, params)
     return pg_cursor.fetchall()
 
@@ -562,16 +489,51 @@ def save_checkpoint(data):
 
 def verify_consistency():
     """
-    對各表做全量一致性檢驗；嵌入陣列欄位則計算總元素數
+    對各表做全量一致性檢驗；
+    ★★★ 新邏輯：PG 端計數時，必須過濾 event_no 白名單 ★★★
     """
+    valid_event_nos_list = list(VALID_EVENT_NOS)
+
     for key, conf in TABLES_CONFIG.items():
-        pg_cursor.execute(f"SELECT COUNT(*) FROM {SCHEMA}.{conf['pg_table']}")
-        pg_count = pg_cursor.fetchone()[0]
-        if "embed_array_field" in conf:
-            arr_field = conf["embed_array_field"]
-            mongo_count = sum(len(doc.get(arr_field, [])) for doc in mongo_dbs["events"].find({}, {arr_field: 1}))
+        # PG 端計數 (加入白名單過濾)
+        pg_count_sql = ""
+        params = [valid_event_nos_list]
+        
+        # 根據不同表格結構，產生不同的計數 SQL
+        if key == "coupon_burui":
+            pg_count_sql = f"""
+                SELECT COUNT(t.*) FROM {SCHEMA}.{conf['pg_table']} t
+                JOIN {SCHEMA}.gif_event_coupon_setting s ON t.coupon_setting_no = s.coupon_setting_no
+                WHERE s.event_no = ANY(%s)
+            """
+        elif key in ["events", "hcc_events", "attendees", "member_types", "coupon_setting"]:
+            # 對於 gif_event，我們只計算那些 event_no 存在於主表 hcc_event 中的數量
+            pg_count_sql = f"SELECT COUNT(*) FROM {SCHEMA}.{conf['pg_table']} WHERE event_no = ANY(%s)"
         else:
-            mongo_count = mongo_dbs[key].count_documents({})
+            logger.warning(f"一致性統計未針對 {key} 設定特別的 SQL，可能不準確。")
+            continue
+
+        pg_cursor.execute(pg_count_sql, params)
+        pg_count = pg_cursor.fetchone()[0]
+
+        # MG 端計數
+        mongo_collection = mongo_dbs[key]
+        if "embed_array_field" in conf:
+            # 嵌入欄位的計數邏輯保持不變，因為寫入時已經過濾
+            arr_field = conf["embed_array_field"]
+            # 這裡的查詢也應該加上 event_no 的過濾
+            mongo_count = sum(len(doc.get(arr_field, [])) for doc in mongo_dbs["events"].find(
+                {"event_no": {"$in": valid_event_nos_list}},
+                {arr_field: 1}
+            ))
+        else:
+            # 對於 events 集合，其總數應該等於白名單的數量
+            if conf["mongo_collection"] == "events":
+                mongo_count = mongo_dbs[key].count_documents({"event_no": {"$in": valid_event_nos_list}})
+            else:
+                 mongo_count = mongo_dbs[key].count_documents({})
+
+
         logger.info(f"一致性統計 {conf['pg_table']}: PG={pg_count}, MG={mongo_count}")
         if pg_count != mongo_count:
             logger.warning(f"一致性不符 {conf['pg_table']} PG={pg_count} vs MG={mongo_count}，需重新同步")
@@ -734,8 +696,28 @@ def parse_args():
 def main():
     global cp_data
     args = parse_args()
-    init_logger(mode='sync')
+
+    # --- 核心修改點：根據參數確定任務名稱 ---
+    task_name = "unknown"
+    if args.full_sync:
+        task_name = "full-sync"
+    elif args.incremental:
+        task_name = "incremental"
+    elif args.correction:
+        task_name = f"correction-{args.correction[0]}" # 例如 correction-attendees
+    elif args.resume:
+        task_name = "resume"
+    elif args.show_status:
+        task_name = "show-status"
+    elif args.reset:
+        task_name = "reset"
+
+    # 使用新的任務名稱來初始化日誌
+    init_logger(task_name=task_name)
+    
+    # 後續邏輯保持不變
     init_db_conn()
+    load_valid_event_nos(pg_conn)
     cp_data = load_checkpoint()
 
     if args.full_sync:
@@ -757,7 +739,9 @@ def main():
     else:
         print("請指定有效參數，使用 --help 查看說明")
 
-    verify_consistency()
+    # 對於不會進行資料比對的任務，可以跳過驗證
+    if task_name not in ["show-status", "reset"]:
+        verify_consistency()
 
     if LOG_FILE:
         print(f"\n日誌檔案：{os.path.abspath(LOG_FILE)}，可用 tail -f 查看")

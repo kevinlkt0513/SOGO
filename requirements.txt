@@ -1,0 +1,8 @@
+# PostgreSQL database driver
+psycopg2-binary
+
+# MongoDB database driver
+pymongo
+
+# Used to load environment variables from .env file
+python-dotenv
