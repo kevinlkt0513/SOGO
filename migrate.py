@@ -1,17 +1,16 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
-
 """
-PostgreSQL → MongoDB 活動資料初始化遷移工具，功能說明：
-- 主表計數，子表異常不影響遷移進度
-- 支援斷點續傳（以時間+event_no 雙鍵）
-- 大批次/粗粒度批次及一致性驗證
-- 延遲日誌初始化，避免沒有參數時產生無效日誌
-- 多線程批量處理，加速同步效率
-- 命令列多模式（全量、增量、補寫、斷點恢復…）
+PostgreSQL → MongoDB 活動資料初始化遷移工具，支援多表雙鍵斷點管理，多模式命令列控制
+功能：
+- 主表及子表分表管理各自斷點(add_date + id / mod_date + id組合雙鍵)
+- 支援全量同步(add_date)、增量同步(mod_date)、補寫、斷點恢復
+- 狀態集中於 base_windows & correction_windows，支援批次級錯誤重試
+- 日誌依同步類型與視窗分檔記錄詳細成功與異常
+- 全量一致性統計，包含嵌入主表文件的陣列欄位比對
+- 配合 checkpoint.json 多表獨立管理，保持運維友好
 """
-
 
 import os
 import sys
@@ -19,21 +18,19 @@ import json
 import logging
 import datetime
 import argparse
-from concurrent.futures import ThreadPoolExecutor, as_completed
-
 
 import psycopg2
 from psycopg2.extras import DictCursor
-from pymongo import MongoClient, UpdateOne
+from pymongo import MongoClient, UpdateOne, IndexModel
 from dotenv import load_dotenv
+from decimal import Decimal
+from bson.decimal128 import Decimal128
+from datetime import date
 
-
-# ===== 讀取環境變數與載入對應 .env 檔案 =====
+# ===== 環境與設定 =====
 ENV = os.getenv("ENV", "dev")
 load_dotenv(f".env.{ENV}", override=True)
 
-
-# PostgreSQL 資料庫設定
 POSTGRESQL_CONFIG = {
     "host": os.getenv("PG_HOST"),
     "port": int(os.getenv("PG_PORT", 5432)),
@@ -42,653 +39,669 @@ POSTGRESQL_CONFIG = {
     "dbname": os.getenv("PG_DBNAME"),
 }
 
-
-# MongoDB 連線字串
 MONGO_URI = os.getenv("MONGO_URI")
-
-
-# 批次大小與最大線程數
 BATCH_SIZE = int(os.getenv("BATCH_SIZE", "500"))
 MAX_WORKERS = int(os.getenv("MAX_WORKERS", "8"))
 SCHEMA = "gift2022"
 
+CHECKPOINT_FILE = "migration_checkpoint.json"
+LOG_DIR = "logs"
+LOG_FILE = None
+logger = None
 
-CHECKPOINT_FILE = "migration_checkpoint.json"  # 斷點檔案
-LOG_DIR = "logs"                              # 日誌目錄
+# 定義多表設定：PG資料表 | 全量時間欄位(add_date) | 斷點時間欄位(mod_date) | 主鍵欄位 | MongoDB 集合名稱 | 嵌入陣列欄位(可選)
+TABLES_CONFIG = {
+    "events": {
+        "pg_table": "gif_event",
+        "add_date_field": "add_date",
+        "mod_date_field": "mod_date",
+        "id_field": "event_no",
+        "mongo_collection": "events",
+    },
+    "hcc_events": {
+        "pg_table": "gif_hcc_event",
+        "add_date_field": "add_date",
+        "mod_date_field": "mod_date",
+        "id_field": "event_no",
+        "mongo_collection": "events",
+    },
+    "attendees": {
+        "pg_table": "gif_hcc_event_attendee",
+        "add_date_field": "add_date",
+        "mod_date_field": "mod_date",
+        "id_field": "id",
+        "mongo_collection": "event_attendees",
+    },
+    "coupon_burui": {
+        "pg_table": "gif_event_coupon_burui",
+        "add_date_field": "add_date",
+        "mod_date_field": "mod_date",
+        "id_field": "id",
+        "mongo_collection": "events",
+        "embed_array_field": "usingBranchIds",
+    },
+    "coupon_setting": {
+        "pg_table": "gif_event_coupon_setting",
+        "add_date_field": "add_date",
+        "mod_date_field": "mod_date",
+        "id_field": "coupon_setting_no",
+        "mongo_collection": "events",
+        "embed_array_field": "prizeCouponJson",
+    },
+    "member_types": {
+        "pg_table": "gif_hcc_event_member_type",
+        "add_date_field": "add_date",
+        "mod_date_field": "mod_date",
+        "id_field": "id",
+        "mongo_collection": "events",
+        "embed_array_field": "memberTypes",
+    },
+}
 
-
-LOG_FILE = None   # 日誌檔名
-logger = None     # logger 實體
-
-
-# ===== 延遲初始化日誌紀錄器 =====
-def init_logger():
+def init_logger(mode=None, window_start=None, window_end=None):
     """
-    啟動日誌系統，在 LOG_DIR 目錄建立以當前時間命名之日誌文件
+    初始化日誌系統，根據同步模式與視窗生成唯一日誌檔名
     """
     global LOG_FILE, logger
     os.makedirs(LOG_DIR, exist_ok=True)
-    LOG_FILE = os.path.join(LOG_DIR, f"migration_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.log")
+    dt_now = datetime.datetime.now().strftime("%Y%m%dT%H%M%S")
+    mode_str = mode if mode else "sync"
+    ws_str = window_start.replace(":", "").replace("-", "") if window_start else "start"
+    we_str = window_end.replace(":", "").replace("-", "") if window_end else "end"
+    instance = os.uname().nodename
+    LOG_FILE = os.path.join(LOG_DIR, f"sync_{mode_str}_window_{ws_str}_{we_str}_{instance}_{dt_now}.log")
     logging.basicConfig(
         filename=LOG_FILE,
         level=logging.INFO,
-        format="[%(asctime)s] %(levelname)s: %(message)s"
+        format="[%(asctime)s] %(levelname)s: %(message)s",
     )
     logger = logging.getLogger()
 
+pg_conn = None
+pg_cursor = None
+mongo_client = None
+mongo_dbs = {}
 
-# ===== 資料庫全局連線物件 =====
-pg_conn = None          # PostgreSQL 連線
-pg_cursor = None        # PostgreSQL 游標
-mongo_client = None     # MongoDB 連線
-col_events = None       # events 集合
-col_attendees = None    # event_attendees 集合
+def ensure_mongodb_indexes(mdb):
+    """
+    確保 MongoDB 中存在必要的索引以提高 upsert 效能
+    """
+    logger.info("開始檢查並建立 MongoDB 索引...")
+    try:
+        # 1. events 集合的索引
+        events_collection = mdb["events"]
+        event_no_index = IndexModel([("event_no", 1)], name="idx_event_no")
+        events_collection.create_indexes([event_no_index])
+        logger.info(f"成功檢查/建立 events 集合的索引: idx_event_no")
 
+        # 2. event_attendees 集合的索引 (最關鍵)
+        attendees_collection = mdb["event_attendees"]
+        attendee_compound_index = IndexModel([("eventNo", 1), ("appId", 1)], name="idx_eventNo_appId")
+        attendees_collection.create_indexes([attendee_compound_index])
+        logger.info(f"成功檢查/建立 event_attendees 集合的索引: idx_eventNo_appId")
+        
+        logger.info("MongoDB 索引檢查完畢。")
+    except Exception as e:
+        logger.error(f"建立 MongoDB 索引時發生錯誤: {e}")
+        # 根據您的策略，這裡可以選擇 sys.exit(1) 或僅是警告
+
+def ensure_postgresql_indexes(conn):
+    """
+    確保 PostgreSQL 中存在推薦的索引
+    """
+    logger.info("開始檢查並建立 PostgreSQL 索引...")
+    # 使用 IF NOT EXISTS 避免重複建立時報錯 (需要 PG 9.5+)
+    indexes_to_create = [
+        f"CREATE INDEX IF NOT EXISTS ix_gif_event_add_date_event_no ON {SCHEMA}.gif_event (add_date, event_no)",
+        f"CREATE INDEX IF NOT EXISTS ix_gif_hcc_event_add_date_event_no ON {SCHEMA}.gif_hcc_event (add_date, event_no)",
+        f"CREATE INDEX IF NOT EXISTS ix_gif_hcc_event_attendee_add_date_id ON {SCHEMA}.gif_hcc_event_attendee (add_date, id)",
+        f"CREATE INDEX IF NOT EXISTS ix_gif_hcc_event_member_type_add_date_id ON {SCHEMA}.gif_hcc_event_member_type (add_date, id)",
+        f"CREATE INDEX IF NOT EXISTS ix_gif_event_coupon_burui_add_date_id ON {SCHEMA}.gif_event_coupon_burui (add_date, id)",
+        f"CREATE INDEX IF NOT EXISTS ix_gif_event_coupon_setting_add_date_coupon_setting_no ON {SCHEMA}.gif_event_coupon_setting (add_date, coupon_setting_no)",
+        f"CREATE INDEX IF NOT EXISTS ix_gif_event_mod_date ON {SCHEMA}.gif_event (mod_date)",
+        f"CREATE INDEX IF NOT EXISTS ix_gif_hcc_event_mod_date ON {SCHEMA}.gif_hcc_event (mod_date)",
+        f"CREATE INDEX IF NOT EXISTS ix_gif_hcc_event_attendee_mod_date ON {SCHEMA}.gif_hcc_event_attendee (mod_date)",
+        f"CREATE INDEX IF NOT EXISTS ix_gif_event_coupon_burui_coupon_setting_no ON {SCHEMA}.gif_event_coupon_burui (coupon_setting_no)",
+        f"CREATE INDEX IF NOT EXISTS ix_gif_event_coupon_setting_coupon_setting_no ON {SCHEMA}.gif_event_coupon_setting (coupon_setting_no)"
+    ]
+    
+    with conn.cursor() as cur:
+        for sql in indexes_to_create:
+            try:
+                logger.info(f"執行: {sql}")
+                cur.execute(sql)
+            except Exception as e:
+                logger.error(f"建立 PostgreSQL 索引失敗: {sql} - 錯誤: {e}")
+                conn.rollback() # 發生錯誤時回滾
+                return # 中斷後續操作
+        conn.commit() # 所有索引指令成功後提交
+    logger.info("PostgreSQL 索引檢查完畢。")
 
 def init_db_conn():
     """
-    初始化 PostgreSQL 和 MongoDB 連線，且建立必要索引
+    初始化 PostgreSQL 與 MongoDB 連接，並確保索引存在
     """
-    global pg_conn, pg_cursor, mongo_client, col_events, col_attendees
+    global pg_conn, pg_cursor, mongo_client, mongo_dbs
     try:
         pg_conn = psycopg2.connect(**POSTGRESQL_CONFIG, cursor_factory=DictCursor)
         pg_cursor = pg_conn.cursor()
+        # 建立/檢查 PostgreSQL 索引
+        ensure_postgresql_indexes(pg_conn)
     except Exception as e:
-        logger.error(f"無法連接 PostgreSQL：{e}")
+        logger.error(f"無法連接 PostgreSQL 或建立索引：{e}")
         sys.exit(1)
-
+        
     try:
         mongo_client = MongoClient(MONGO_URI)
-        mdb = mongo_client["sogo_gift"]
-        col_events = mdb["events"]
-        col_attendees = mdb["event_attendees"]
-        # 依常用查詢加建立索引
-        col_events.create_index([
-            ("hccEventType", 1), ("eventStatus", 1), ("onlyApp", 1),
-            ("startDate", 1), ("endDate", 1)
-        ])
-        col_events.create_index("memberTypes")
-        col_attendees.create_index([("eventNo", 1), ("appId", 1)], unique=True)
+        mdb = mongo_client["gift"]  # 請根據實際庫名調整
+        
+        # 建立/檢查 MongoDB 索引
+        ensure_mongodb_indexes(mdb)
+        
+        for k, v in TABLES_CONFIG.items():
+            mongo_dbs[k] = mdb[v["mongo_collection"]]
+
     except Exception as e:
-        logger.error(f"無法連接 MongoDB：{e}")
+        logger.error(f"無法連接 MongoDB 或建立索引：{e}")
         sys.exit(1)
 
-
-# ===== 分館名稱映射表（供顯示及比對排序使用） =====
-BRANCH_ORDER = {
-    "BRANCH_TAIWAN": "全台", "BRANCH_TAIPEI": "台北店", "BRANCH_JS": "忠孝館",
-    "BRANCH_FS": "復興館", "BRANCH_DH": "敦化館", "BRANCH_TM": "天母店",
-    "BRANCH_JL": "中壢店", "BRANCH_BC": "新竹店", "BRANCH_GS": "高雄店",
-    "BRANCH_GC": "Garden City", "BRANCH_GCA": "Garden City-A區",
-    "BRANCH_GCB": "Garden City-B區", "BRANCH_GCC": "Garden City-C區", "BRANCH_GCD": "Garden City-D區"
-}
-
-
-# ===== 擴充主活動資料，掛入會員類型與適用分館資訊 =====
-def enrich_event(event):
+def fetch_batch(table_key, start_time, end_time,
+                last_checkpoint_time=None, last_checkpoint_id=None,
+                batch_size=100, mode="incremental"):
     """
-    擴充活動資料字典，執行以下操作：
-    1. 查詢此活動對應的會員類型，並加入 event["memberTypes"] 列表
-    2. 查詢此活動對應優惠券所適用的分館清單，
-       並排序後分別存入 event["usingBranchIds"] (分館ID) 與 event["usingBranchNames"] (分館名稱)
-    3. 將字串型布林欄位（onlyApp、allMember）轉換為布林值 (True/False) 方便後續使用
-
-    異常處理：
-    - 若查詢會員類型或優惠券分館失敗，則對應欄位設為空列表並記錄警告日誌
+    批次擷取指定表於時間視窗內之資料
+    - 支援全量/增量/斷點模式
+    - 增量模式下 mod_date 為 NULL 時回退到 add_date
+    - coupon_burui 特殊處理：JOIN coupon_setting 補 event_no
     """
+    conf = TABLES_CONFIG[table_key]
 
-    event_no = event["eventNo"]  # 取得活動編號，作為查詢條件
+    # ========= 全量模式 =========
+    if mode == "full":
+        date_field = conf["add_date_field"]
 
-    # 查詢會員類型，若有多筆則聚合成列表賦值給 event["memberTypes"]
-    try:
-        sql = f"SELECT member_type FROM {SCHEMA}.gif_hcc_event_member_type WHERE event_no = %s"
-        logger.info(f"[SQL] 查會員類型: {sql} 參數: [{event_no}]")
-        pg_cursor.execute(sql, (event_no,))
-        rows = pg_cursor.fetchall()
-        event["memberTypes"] = [r["member_type"] for r in rows] if rows else []
-    except Exception as e:
-        # 查詢失敗時，記錄警告並賦值空列表避免程式中斷
-        logger.warning(f"會員類型查詢失敗，事件 {event_no}，錯誤：{e}")
-        event["memberTypes"] = []
-
-    # 查詢優惠券適用分館，利用子查詢取得活動關聯coupon_setting_no，撈取對應分館branch
-    try:
-        sql = f"""
-            SELECT DISTINCT branch
-            FROM {SCHEMA}.gif_event_coupon_burui
-            WHERE coupon_setting_no IN (
-                SELECT coupon_setting_no FROM {SCHEMA}.gif_event_coupon_setting WHERE event_no = %s
-            )
-        """
-        logger.info(f"[SQL] 查優惠券分館: 參數 [{event_no}]")
-        pg_cursor.execute(sql, (event_no,))
-        branches = [r["branch"] for r in pg_cursor.fetchall()]
-        if branches:
-            # 根據預設分館順序 BRANCH_ORDER 排序分館ID清單
-            sorted_ids = sorted(branches, key=lambda b: list(BRANCH_ORDER.keys()).index(b) if b in BRANCH_ORDER else 9999)
-            event["usingBranchIds"] = sorted_ids
-            # 取得對應中文分館名稱，找不到時以ID代替
-            event["usingBranchNames"] = [BRANCH_ORDER.get(b, b) for b in sorted_ids]
+        if table_key == "coupon_burui":
+            # 全量 + JOIN
+            if last_checkpoint_time is None or last_checkpoint_id is None:
+                sql = f"""
+                SELECT b.*, s.event_no
+                FROM {SCHEMA}.gif_event_coupon_burui b
+                JOIN {SCHEMA}.gif_event_coupon_setting s
+                  ON b.coupon_setting_no = s.coupon_setting_no
+                WHERE b.{date_field} >= %s AND b.{date_field} < %s
+                ORDER BY b.{date_field}, b.{conf['id_field']}
+                LIMIT %s
+                """
+                params = [start_time, end_time, batch_size]
+            else:
+                sql = f"""
+                SELECT b.*, s.event_no
+                FROM {SCHEMA}.gif_event_coupon_burui b
+                JOIN {SCHEMA}.gif_event_coupon_setting s
+                  ON b.coupon_setting_no = s.coupon_setting_no
+                WHERE
+                  (b.{date_field} > %s OR (
+                      b.{date_field} = %s AND b.{conf['id_field']} > %s
+                  ))
+                  AND b.{date_field} >= %s AND b.{date_field} < %s
+                ORDER BY b.{date_field}, b.{conf['id_field']}
+                LIMIT %s
+                """
+                params = [last_checkpoint_time, last_checkpoint_time, last_checkpoint_id,
+                          start_time, end_time, batch_size]
         else:
-            # 無匹配資料則設空列表
-            event["usingBranchIds"] = []
-            event["usingBranchNames"] = []
-    except Exception as e:
-        # 查詢失敗時，記錄警告並將分館欄位設為空值
-        logger.warning(f"優惠券分館查詢失敗，事件 {event_no}，錯誤：{e}")
-        event["usingBranchIds"] = []
-        event["usingBranchNames"] = []
+            # 普通表全量
+            if last_checkpoint_time is None or last_checkpoint_id is None:
+                sql = f"""
+                SELECT * FROM {SCHEMA}.{conf['pg_table']}
+                WHERE {date_field} >= %s AND {date_field} < %s
+                ORDER BY {date_field}, {conf['id_field']}
+                LIMIT %s
+                """
+                params = [start_time, end_time, batch_size]
+            else:
+                sql = f"""
+                SELECT * FROM {SCHEMA}.{conf['pg_table']}
+                WHERE
+                  ({date_field} > %s OR (
+                      {date_field} = %s AND {conf['id_field']} > %s
+                  ))
+                  AND {date_field} >= %s AND {date_field} < %s
+                ORDER BY {date_field}, {conf['id_field']}
+                LIMIT %s
+                """
+                params = [last_checkpoint_time, last_checkpoint_time, last_checkpoint_id,
+                          start_time, end_time, batch_size]
 
-    # 將字串"Y"/"N"轉換為布林值 True/False
-    event["onlyApp"] = event.get("onlyApp", "N") == 'Y'
-    event["allMember"] = event.get("allMember", "N") == 'Y'
-
-    return event
-
-
-# ===== 批次抓取event_no，支援斷點（雙鍵：日期+event_no） =====
-def fetch_events_batch(start_time, end_time, last_checkpoint_time=None, last_checkpoint_id=None, batch_size=100):
-    """
-    批次取得指定時間範圍內需遷移的活動編號 (event_no)。
-
-    支援依時間戳記加事件ID雙鍵進行斷點續傳，
-    可避免重複處理或遺漏資料。
-    
-    參數：
-    - start_time: 起始時間，字串或 datetime 物件
-    - end_time: 結束時間，字串或 datetime 物件
-    - last_checkpoint_time: 上一次斷點時間 (ISO字串或 datetime)，作為下一批次的起點時間
-    - last_checkpoint_id: 上一次斷點事件編號 (event_no)，輔助斷點定位
-    - batch_size: 單次抓取最大活動數量限制
-
-    回傳：
-    - list of event_no，為符合條件的活動事件編號清單
-    """
-
-    # 若輸入為字串，轉換成 datetime 物件方便比較及 SQL 傳參
-    if isinstance(start_time, str):
-        start_time = datetime.datetime.fromisoformat(start_time)
-    if isinstance(end_time, str):
-        end_time = datetime.datetime.fromisoformat(end_time)
-
-    # 判斷是否為斷點續傳模式，需指定上一筆時間與event_no為雙鍵
-    if last_checkpoint_time is not None and last_checkpoint_id is not None:
-        sql = f"""
-            SELECT event_no
-            FROM {SCHEMA}.gif_event
-            WHERE 
-              -- 從斷點時間下一筆起，依時間先後排序補抓
-              (exchange_start_date > %s 
-               OR (exchange_start_date = %s AND event_no > %s))
-              -- 且在本次窗口指定時間區間內
-              AND exchange_start_date >= %s AND exchange_start_date < %s
-            ORDER BY exchange_start_date, event_no
-            LIMIT %s
-        """
-        # SQL參數依序為：斷點時間、斷點時間、斷點event_no、窗口起始、窗口結束、抓取數量上限
-        params = [last_checkpoint_time, last_checkpoint_time, last_checkpoint_id, start_time, end_time, batch_size]
+    # ========= 增量模式（resume） =========
     else:
-        # 非斷點模式，直接在窗口時間範圍內依時間及event_no排序抓取
-        sql = f"""
-            SELECT event_no
-            FROM {SCHEMA}.gif_event
-            WHERE exchange_start_date >= %s AND exchange_start_date < %s
-            ORDER BY exchange_start_date, event_no
-            LIMIT %s
-        """
-        params = [start_time, end_time, batch_size]
+        mod_field = conf["mod_date_field"]
+        add_field = conf["add_date_field"]
 
-    # 紀錄 SQL 查詢語句與參數方便追蹤與除錯
-    logger.info(f"[SQL] fetch_events_batch:\n{sql}\n參數: {params}")
+        # coupon_burui 特殊处理：JOIN + 回退 add_date
+        if table_key == "coupon_burui":
+            if last_checkpoint_time is None or last_checkpoint_id is None:
+                sql = f"""
+                SELECT b.*, s.event_no
+                FROM {SCHEMA}.gif_event_coupon_burui b
+                JOIN {SCHEMA}.gif_event_coupon_setting s
+                  ON b.coupon_setting_no = s.coupon_setting_no
+                WHERE (
+                    (b.{mod_field} IS NOT NULL AND b.{mod_field} >= %s AND b.{mod_field} < %s)
+                    OR
+                    (b.{mod_field} IS NULL AND b.{add_field} >= %s AND b.{add_field} < %s)
+                )
+                ORDER BY COALESCE(b.{mod_field}, b.{add_field}), b.{conf['id_field']}
+                LIMIT %s
+                """
+                params = [start_time, end_time, start_time, end_time, batch_size]
+            else:
+                sql = f"""
+                SELECT b.*, s.event_no
+                FROM {SCHEMA}.gif_event_coupon_burui b
+                JOIN {SCHEMA}.gif_event_coupon_setting s
+                  ON b.coupon_setting_no = s.coupon_setting_no
+                WHERE (
+                    (b.{mod_field} IS NOT NULL AND (
+                        b.{mod_field} > %s OR (
+                            b.{mod_field} = %s AND b.{conf['id_field']} > %s
+                        )
+                    ) AND b.{mod_field} < %s)
+                    OR
+                    (b.{mod_field} IS NULL AND (
+                        b.{add_field} > %s OR (
+                            b.{add_field} = %s AND b.{conf['id_field']} > %s
+                        )
+                    ) AND b.{add_field} < %s)
+                )
+                AND COALESCE(b.{mod_field}, b.{add_field}) >= %s
+                AND COALESCE(b.{mod_field}, b.{add_field}) < %s
+                ORDER BY COALESCE(b.{mod_field}, b.{add_field}), b.{conf['id_field']}
+                LIMIT %s
+                """
+                params = [
+                    last_checkpoint_time, last_checkpoint_time, last_checkpoint_id, end_time,
+                    last_checkpoint_time, last_checkpoint_time, last_checkpoint_id, end_time,
+                    start_time, end_time,
+                    batch_size
+                ]
 
-    # 執行 SQL 查詢
+        # 普通表的增量查询
+        else:
+            if last_checkpoint_time is None or last_checkpoint_id is None:
+                sql = f"""
+                SELECT * FROM {SCHEMA}.{conf['pg_table']}
+                WHERE (
+                    ({mod_field} IS NOT NULL AND {mod_field} >= %s AND {mod_field} < %s)
+                    OR
+                    ({mod_field} IS NULL AND {add_field} >= %s AND {add_field} < %s)
+                )
+                ORDER BY COALESCE({mod_field}, {add_field}), {conf['id_field']}
+                LIMIT %s
+                """
+                params = [start_time, end_time, start_time, end_time, batch_size]
+            else:
+                sql = f"""
+                SELECT * FROM {SCHEMA}.{conf['pg_table']}
+                WHERE (
+                    ({mod_field} IS NOT NULL AND (
+                        {mod_field} > %s OR (
+                            {mod_field} = %s AND {conf['id_field']} > %s
+                        )
+                    ) AND {mod_field} < %s)
+                    OR
+                    ({mod_field} IS NULL AND (
+                        {add_field} > %s OR (
+                            {add_field} = %s AND {conf['id_field']} > %s
+                        )
+                    ) AND {add_field} < %s)
+                )
+                AND COALESCE({mod_field}, {add_field}) >= %s
+                AND COALESCE({mod_field}, {add_field}) < %s
+                ORDER BY COALESCE({mod_field}, {add_field}), {conf['id_field']}
+                LIMIT %s
+                """
+                params = [
+                    last_checkpoint_time, last_checkpoint_time, last_checkpoint_id, end_time,
+                    last_checkpoint_time, last_checkpoint_time, last_checkpoint_id, end_time,
+                    start_time, end_time,
+                    batch_size
+                ]
+
+    logger.info(f"[SQL-{table_key}] {sql.replace(chr(10), ' ')} params {params}")
     pg_cursor.execute(sql, params)
+    return pg_cursor.fetchall()
 
-    # 取得查詢結果
-    rows = pg_cursor.fetchall()
-
-    # 回傳活動編號列表，供後續遷移使用
-    return [row["event_no"] for row in rows]
-
-
-# ===== 取得指定活動完整內容 =====
-def fetch_event(event_no):
+def normalize_value(v):
     """
-    從 PostgreSQL 資料庫中聯查主活動表與附表，
-    擷取指定 event_no 的完整活動資料。
-
-    查詢欄位包含：
-    - 主活動表 (gif_hcc_event) 的細節欄位，如事件備註、分館、優惠券JSON、注意事項連結、布林欄位等
-    - 附表 (gif_event) 的共用欄位，如活動名稱、狀態、開始結束日期及網址
-    結果將以字典形式返回，欄位名稱已格式化對應。
-
-    若找不到資料則回傳 None。
+    將 Decimal, date, datetime 等不可直存 MongoDB 的類型轉換為可序列化原生類型
     """
+    # 處理高精度十進位
+    if isinstance(v, Decimal):
+        try:
+            return Decimal128(v)
+        except (TypeError, ValueError, OverflowError):
+            return float(v)
+    # 處理 datetime.datetime
+    if isinstance(v, datetime.datetime):
+        return v
+    # 處理 date
+    if isinstance(v, date):
+        return datetime.datetime.combine(v, datetime.datetime.min.time())
+    # 其他類型直接返回
+    return v
 
-    # 複合 SQL 查詢同時取得兩表資料，依 event_no 做連接條件
-    sql = f"""
-        SELECT he.event_no, he.event_memo, he.branch AS eventBranchId, he.prize_coupon_json,
-               he.gift_attention_url, he.only_app, he.all_member, he.hcc_event_type,
-               e.name, e.event_status, e.exchange_start_date, e.exchange_end_date, e.web_url
-        FROM {SCHEMA}.gif_hcc_event he
-        JOIN {SCHEMA}.gif_event e ON he.event_no = e.event_no
-        WHERE he.event_no = %s
+def normalize_row(row):
     """
-
-    # 記錄 SQL 執行資訊，方便除錯
-    logger.info(f"[SQL] fetch_event {event_no}")
-
-    # 執行 SQL，帶入活動編號參數
-    pg_cursor.execute(sql, (event_no,))
-
-    # 取得單筆查詢結果
-    row = pg_cursor.fetchone()
-
-    # 若無資料則回傳 None
-    if not row:
-        return None
-
-    # 對應查詢結果欄位，組成字典方便後續處理
-    keys = [
-        "eventNo", "eventMemo", "eventBranchId", "prizeCouponJson", "giftAttentionUrl",
-        "onlyApp", "allMember", "hccEventType", "name", "eventStatus",
-        "startDate", "endDate", "giftInforUrl"
-    ]
-
-    # 將鍵值配對回傳字典
-    return dict(zip(keys, row))
-
-
-# ===== 執行某活動所有參與者資料遷移（子表，異常不中斷） =====
-def migrate_attendees(event_no):
+    將 DictCursor 返回的 row 中所有值做 normalize
     """
-    遷移指定活動的所有參與者資料至 MongoDB。
+    return {k: normalize_value(v) for k, v in row.items()}
 
-    主要流程：
-    1. 從 PostgreSQL 中查詢該活動(event_no)所有參與者的 app_id 列表
-    2. 組合 MongoDB 批次 upsert 請求 (UpdateOne)，
-       使用 eventNo 與 appId 作唯一鍵確保資料不重複
-    3. 使用 MongoDB 的 bulk_write 非同步執行批次操作提升效能
-    4. 回傳本次成功 upsert（新增）筆數
-    5. 如有異常，紀錄警告日誌並回傳 0，避免阻斷整體遷移流程
-
-    參數：
-    - event_no: 活動編號
-
-    回傳：
-    - int: 成功 upsert 參與者資料筆數
+def upsert_batch(table_key, rows):
     """
-    try:
-        # SQL 查詢該活動全部參與者 app_id
-        sql = f"SELECT app_id FROM {SCHEMA}.gif_hcc_event_attendee WHERE event_no = %s"
-        logger.info(f"[SQL] migrate_attendees {event_no}")
-        pg_cursor.execute(sql, (event_no,))
-        rows = pg_cursor.fetchall()
+    批次 upsert 資料至 MongoDB，支援嵌入陣列欄位與單文件 upsert
+    """
+    conf = TABLES_CONFIG[table_key]
+    requests = []
+    for row in rows:
+        # 先調用 normalize_row 轉換所有欄位
+        doc = normalize_row(row)
 
-        # 若無參與者資料，直接回傳 0
-        if not rows:
-            return 0
+        if "embed_array_field" in conf:
+            # 嵌入陣列更新：使用 $addToSet 避免重複
+            filter_cond = {"event_no": doc["event_no"]}
+            requests.append(UpdateOne(
+                filter_cond,
+                {"$addToSet": {conf["embed_array_field"]: doc}},
+                upsert=True
+            ))
+        else:
+            # 單文件 upsert
+            if table_key == "attendees":
+                filter_cond = {"eventNo": doc.get("event_no"), "appId": doc.get("app_id")}
+            else:
+                filter_cond = {conf["id_field"]: doc[conf["id_field"]]}
+            requests.append(UpdateOne(filter_cond, {"$set": doc}, upsert=True))
 
-        requests = []
-        # 將查詢結果逐筆轉為 MongoDB UpdateOne upsert 請求
-        for r in rows:
-            app_id = r.get("app_id")
-            if app_id:
-                requests.append(UpdateOne(
-                    # 查詢條件，確保唯一參考eventNo與appId
-                    {"eventNo": event_no, "appId": app_id},
-                    # 若不存在則新增，使用 $setOnInsert 操作符
-                    {"$setOnInsert": {"eventNo": event_no, "appId": app_id}},
-                    upsert=True
-                ))
-
-        # 若無有效請求（理論上不會），直接回傳 0
-        if not requests:
-            return 0
-
-        # 執行 MongoDB 批次寫入，ordered=False 允許並行執行以提升效率
-        result = col_attendees.bulk_write(requests, ordered=False)
-
-        # 回傳本次 upsert 新增的筆數
-        return result.upserted_count
-
-    except Exception as e:
-        # 捕獲異常，記錄警告以示非致命錯誤，並回傳0
-        # 確保單筆活動參與者資料寫入失敗不會終止整體遷移流程
-        logger.warning(f"參與者資料寫入失敗，事件 {event_no}，錯誤：{e}")
+    if not requests:
         return 0
+    result = mongo_dbs[table_key].bulk_write(requests, ordered=False)
+    return result.upserted_count
 
-
-# ===== 遷移單一活動 (主表、關聯子表)，統一用 bulkWrite + upsert =====
-def migrate_single_event(event_no):
+def update_checkpoint(table_key, last_time, last_id, processed_count, window=None, status=None):
     """
-    遷移單一活動資料與其參與者資料，全部使用 bulkWrite + upsert 模式。
-
-    流程：
-    1. 取得主活動資料，若找不到回傳 False
-    2. 擴充活動資料（會員類型、分館等）
-    3. 用 bulk_write 實現 update_one + upsert，若資料存在更新，否則新增
-    4. 執行參與者資料遷移（同樣批次 upsert）
-    5. 回傳成功狀態
+    更新 checkpoint.json 中之斷點時間、ID 及視窗狀態
     """
-    try:
-        event = fetch_event(event_no)
-        if not event:
-            logger.warning(f"找不到活動 {event_no}")
-            return False
+    global cp_data
+    cp_table = cp_data.setdefault(table_key, {})
+    cp_table["last_checkpoint_time"] = last_time
+    cp_table["last_checkpoint_id"] = last_id
+    if window:
+        for w in cp_table.setdefault("base_windows", []):
+            if w["start"] == window["start"] and w["end"] == window["end"]:
+                w["last_checkpoint_time"] = last_time
+                w["last_checkpoint_id"] = last_id
+                w["processed_count"] = processed_count
+                if status:
+                    w["status"] = status
+                w["last_mod_date"] = datetime.datetime.now().isoformat()
+                break
+    save_checkpoint(cp_data)
 
-        event = enrich_event(event)
+def migrate_table_window(table_key, window, mode="incremental"):
+    global cp_data
+    conf = TABLES_CONFIG[table_key]
 
-        # 準備更新請求，使用 update_one + upsert 保證存在時更新，不存在時新增
-        request = UpdateOne(
-            {"eventNo": event_no},
-            {"$set": event},
-            upsert=True
-        )
-        col_events.bulk_write([request], ordered=False)
-
-        # 參與者資料統一用 upsert 批量寫入，因有唯一索引，不會重複
-        inserted = migrate_attendees(event_no)
-
-        logger.info(f"活動 {event_no} 遷移成功，參與者 {inserted} 筆")
-        return True
-    except Exception as e:
-        logger.error(f"活動 {event_no} 遷移失敗，錯誤：{e}")
-        return False
-
-
-# ===== 統計指定時間段主表活動資料數量 =====
-def count_pg_events_in_window(start, end):
-    """
-    統計 PostgreSQL 主表中，指定時間區間 (start 到 end) 內的活動總筆數。
-
-    功能說明：
-    - 利用 INNER JOIN 同步主活動表 (gif_hcc_event) 與附表 (gif_event)
-      以確保計數活動均存在於兩表中
-    - 使用 exchange_start_date 作為時間範圍條件過濾
-    - 返回該時間段內活動的完整數量，作為遷移進度校驗依據
-
-    參數：
-    - start: 起始時間，datetime 或 ISO8601 字串
-    - end: 結束時間，datetime 或 ISO8601 字串
-
-    回傳：
-    - int: 符合條件的活動筆數
-    """
-
-    if isinstance(start, str):
-        start = datetime.datetime.fromisoformat(start)
-    if isinstance(end, str):
-        end = datetime.datetime.fromisoformat(end)
-
-    sql = f"""
-        SELECT COUNT(*)
-        FROM {SCHEMA}.gif_hcc_event he
-        JOIN {SCHEMA}.gif_event e ON he.event_no = e.event_no
-        WHERE e.exchange_start_date >= %s AND e.exchange_start_date < %s
-    """
-
-    pg_cursor.execute(sql, (start, end))
-
-    return pg_cursor.fetchone()[0]
-
-
-# ===== 遷移單個窗口，包含多活動 =====
-def migrate_window(window: dict, window_name: str):
-    """
-    處理指定「時間窗口」內的活動資料遷移。
-
-    功能說明：
-    - 根據斷點時間(last_checkpoint_time)和事件ID(last_checkpoint_id)批次抓取待遷移活動清單
-    - 單筆遷移並持續更新斷點資料以支持續傳
-    - 監控連續失敗次數，避免死循環
-    - 完成後更新窗口狀態並記錄執行時間與統計
-    """
-    logger.info(f"處理窗口 {window_name}：{window['start']} ~ {window['end']} 狀態：{window['status']}")
-
-    if window.get("status") == "completed":
-        logger.info(f"{window_name} 已完成，跳過")
-        return 0
-
-    last_time = window.get("last_checkpoint_time")
+    start = window["start"]
+    end = window["end"]
+    last_t = window.get("last_checkpoint_time")
     last_id = window.get("last_checkpoint_id")
+    processed = 0
 
     window["status"] = "in_progress"
-    window["owner"] = os.uname().nodename
     window["start_exec_time"] = datetime.datetime.now().isoformat()
     save_checkpoint(cp_data)
 
-    migrated = 0
-    consecutive_fail_count = 0
+    consecutive_errors = 0
 
     while True:
-        batch_event_nos = fetch_events_batch(window["start"], window["end"], last_time, last_id, BATCH_SIZE)
+        rows = fetch_batch(table_key, start, end, last_t, last_id, BATCH_SIZE, mode=mode)
 
-        if not batch_event_nos:
-            pg_total = count_pg_events_in_window(window["start"], window["end"])
-            logger.info(f"PG主表總數：{pg_total}，已成功遷移：{migrated}")
-
-            if migrated >= pg_total:
-                window["status"] = "completed"
-                logger.info(f"{window_name} 窗口已完成")
-            else:
-                window["status"] = "pending"
-                logger.warning(f"{window_name} 窗口尚有 {pg_total - migrated} 筆未遷移")
+        if not rows:
+            window["status"] = "completed"
+            window["finish_exec_time"] = datetime.datetime.now().isoformat()
+            save_checkpoint(cp_data)
+            logger.info(f"{table_key} 視窗 {start}~{end} 同步完成，總計 {processed} 筆")
             break
 
-        logger.info(f"{window_name} 批次大小：{len(batch_event_nos)}")
+        try:
+            upsert_batch(table_key, rows)
+            processed += len(rows)
 
-        for eno in batch_event_nos:
-            success = migrate_single_event(eno)
+            last_row = rows[-1]
 
-            if success:
-                migrated += 1
-                last_id = eno
-
-                pg_cursor.execute(f"SELECT exchange_start_date FROM {SCHEMA}.gif_event WHERE event_no = %s", (eno,))
-                row = pg_cursor.fetchone()
-                if row and row["exchange_start_date"]:
-                    last_time = row["exchange_start_date"].isoformat()
-                else:
-                    logger.warning(f"取event_no：{eno} 時間失敗，斷點時間不更新")
-
-                window["last_checkpoint_time"] = last_time
-                window["last_checkpoint_id"] = last_id
-                window["processed_count"] = migrated
-                window["last_update_time"] = datetime.datetime.now().isoformat()
-                save_checkpoint(cp_data)
-
-                consecutive_fail_count = 0
-                logger.info(f"活動 {eno} 遷移成功，斷點時間更新: {last_time}")
+            # === 关键修改：时间键 fallback ===
+            if mode == "incremental":
+                # 优先用 mod_date，没有就用 add_date
+                time_key_value = last_row.get(conf["mod_date_field"]) or last_row.get(conf["add_date_field"])
             else:
-                consecutive_fail_count += 1
-                logger.warning(f"活動 {eno} 遷移失敗，連續錯誤計數 {consecutive_fail_count}")
+                time_key_value = last_row.get(conf["add_date_field"])
 
-                if consecutive_fail_count >= 5:
-                    logger.error(f"{window_name} 連續 5 筆失敗，終止遷移避免死循環")
-                    return migrated
+            id_key_value = last_row.get(conf["id_field"])
 
-    window["finish_exec_time"] = datetime.datetime.now().isoformat()
-    save_checkpoint(cp_data)
+            # 防御性检查
+            if time_key_value is None or id_key_value is None:
+                logger.error(
+                    f"{table_key} 無法獲取有效的斷點值，時間: {time_key_value}, ID: {id_key_value}，最後一行數據: {last_row}"
+                )
+                # 不更新断点，继续下一批
+                continue
 
-    pg_count = count_pg_events_in_window(window["start"], window["end"])
-    fail_count = max(pg_count - migrated, 0)
+            # 存储 ISO 格式
+            last_t = time_key_value.isoformat()
+            last_id = id_key_value
 
-    logger.info(f"\n-- {window_name} 窗口遷移總結 --")
-    logger.info(f"窗戶時間範圍: {window['start']} ~ {window['end']}")
-    logger.info(f"PG主表筆數: {pg_count}")
-    logger.info(f"成功遷移筆數: {migrated}")
-    logger.info(f"失敗筆數: {fail_count}")
-    logger.info(f"窗口狀態: {window['status']}\n")
+            update_checkpoint(
+                table_key,
+                last_t,
+                last_id,
+                processed,
+                window,
+                status="in_progress"
+            )
 
-    return migrated
+            consecutive_errors = 0
+            logger.info(
+                f"{table_key} 同步批次成功，records={len(rows)}, "
+                f"last_time={last_t}, last_id={last_id}"
+            )
 
+        except Exception as e:
+            consecutive_errors += 1
+            logger.error(
+                f"{table_key} 視窗 {start}~{end} 同步批次異常，第 {consecutive_errors} 次錯誤: {e}"
+            )
+            if consecutive_errors >= 5:
+                window["status"] = "pending"
+                save_checkpoint(cp_data)
+                logger.error(f"{table_key} 視窗多次失敗終止，狀態改為 pending")
+                break
 
-# ===== 斷點資料的載入/儲存 =====
+    return processed
+
+def convert_decimal_for_json(obj):
+    """
+    遞歸轉換資料結構中所有 Decimal 為 float 或 str，避免 json.dump 失敗
+    """
+    if isinstance(obj, dict):
+        return {k: convert_decimal_for_json(v) for k, v in obj.items()}
+    elif isinstance(obj, list):
+        return [convert_decimal_for_json(elem) for elem in obj]
+    elif isinstance(obj, Decimal):
+        # 可選擇轉 float 或 str，根據場景決定精度需求
+        return float(obj)
+    else:
+        return obj
+
 def load_checkpoint():
     """
-    從檔案載入上次同步斷點, 不存在則初始化空結構
+    載入或初始化 checkpoint.json
     """
     if os.path.exists(CHECKPOINT_FILE):
         with open(CHECKPOINT_FILE, "r", encoding="utf-8") as f:
             return json.load(f)
-    return {"base_windows": [], "correction_windows": []}
-
+    return {table_key: {"base_windows": [], "correction_windows": [], "last_checkpoint_time": None, "last_checkpoint_id": None} for table_key in TABLES_CONFIG.keys()}
 
 def save_checkpoint(data):
     """
-    將同步進度與狀態存檔到checkpoint
+    儲存 checkpoint.json，轉換 Decimal 類型，避免序列化異常
     """
+    safe_data = convert_decimal_for_json(data)
     with open(CHECKPOINT_FILE, "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
+        json.dump(safe_data, f, ensure_ascii=False, indent=2)
 
+def verify_consistency():
+    """
+    對各表做全量一致性檢驗；嵌入陣列欄位則計算總元素數
+    """
+    for key, conf in TABLES_CONFIG.items():
+        pg_cursor.execute(f"SELECT COUNT(*) FROM {SCHEMA}.{conf['pg_table']}")
+        pg_count = pg_cursor.fetchone()[0]
+        if "embed_array_field" in conf:
+            arr_field = conf["embed_array_field"]
+            mongo_count = sum(len(doc.get(arr_field, [])) for doc in mongo_dbs["events"].find({}, {arr_field: 1}))
+        else:
+            mongo_count = mongo_dbs[key].count_documents({})
+        logger.info(f"一致性統計 {conf['pg_table']}: PG={pg_count}, MG={mongo_count}")
+        if pg_count != mongo_count:
+            logger.warning(f"一致性不符 {conf['pg_table']} PG={pg_count} vs MG={mongo_count}，需重新同步")
 
-# ====== 命令處理（全量、增量、補寫、恢復、狀態等模式） =====
 def command_full_sync(end_time=None):
     """
-    全量同步：將自 1970-01-01（Linux 紀元時間起點）起至指定結束時間範圍內，
-    所有活動資料一次性同步至目標資料庫（MongoDB）。
-
-    透過時間區間劃分「基線窗口」（base_windows），以批次方式逐窗同步，
-    如窗口不存在則新增並儲存斷點，支援斷點續傳功能。
+    全量同步：從1970-01-01T00:00:00至 end_time 建立基線視窗並同步(add_date)
     """
-
+    global cp_data
     if end_time is None:
         end_time = datetime.datetime.now().isoformat()
-
-    global cp_data
-
-    cp_data.setdefault("base_windows", [])
-
-    exists = any(
-        w["start"] == "1970-01-01T00:00:00" and w["end"] == end_time
-        for w in cp_data["base_windows"]
-    )
-
-    if not exists:
-        cp_data["base_windows"].append({
-            "start": "1970-01-01T00:00:00",
-            "end": end_time,
-            "status": "pending",
-            "owner": None,
-            "processed_count": 0,
-            "last_checkpoint_time": None,
-            "last_checkpoint_id": None,
-            "last_update_time": None,
-            "start_exec_time": None,
-            "finish_exec_time": None
-        })
-        save_checkpoint(cp_data)
-        logger.info(f"新增基線窗口: 1970-01-01 至 {end_time}")
-
+    for table_key in TABLES_CONFIG.keys():
+        base_windows = cp_data.setdefault(table_key, {}).setdefault("base_windows", [])
+        exist = any(w for w in base_windows if w["start"] == "1970-01-01T00:00:00" and w["end"] == end_time)
+        if not exist:
+            base_windows.append({
+                "start": "1970-01-01T00:00:00",
+                "end": end_time,
+                "status": "pending",
+                "mode": "full",  # <--- 修改點：明確記錄視窗模式
+                "processed_count": 0,
+                "last_checkpoint_time": None,
+                "last_checkpoint_id": None,
+                "last_mod_date": None,
+                "owner": None,
+                "start_exec_time": None,
+                "finish_exec_time": None
+            })
+    save_checkpoint(cp_data)
+    logger.info(f"新增所有表基線視窗: 1970-01-01 至 {end_time}")
     total = 0
-    for idx, w in enumerate(cp_data["base_windows"]):
-        if w["status"] in ("pending", "in_progress"):
-            total += migrate_window(w, f"base_windows[{idx}]")
-
-    print(f"全量同步完成，遷移筆數: {total}")
-
+    for table_key in TABLES_CONFIG.keys():
+        for w in cp_data[table_key]["base_windows"]:
+            if w["status"] in ("pending", "in_progress"):
+                # <--- 這裡不需要改動，因為首次執行時模式就是正確的
+                total += migrate_table_window(table_key, w, mode="full")
+    print(f"全量同步完成，共同步 {total} 筆記錄")
 
 def command_incremental(end_time=None):
     """
-    執行增量同步任務：
-    - 只處理自最後一個 base_windows 窗口的結束時間起至指定最新時間區間的新增或變更資料
-    - 新增一個 pending 狀態的 base_windows 窗口來篩選這段時間內需遷移的資料
-    - 此設計避免重複遷移舊資料，並保持狀態透明和追蹤清晰
+    增量同步：以上次斷點為起點至 end_time 同步(mod_date)
     """
+    global cp_data
     if end_time is None:
         end_time = datetime.datetime.now().isoformat()
-
-    global cp_data
-
-    cp_data.setdefault("base_windows", [])
-
-    if cp_data["base_windows"]:
-        last_window = max(cp_data["base_windows"], key=lambda w: w["end"])
-        start_time = last_window["end"]
-    else:
-        start_time = "1970-01-01T00:00:00"
-
-    cp_data["base_windows"].append({
-        "start": start_time,
-        "end": end_time,
-        "status": "pending",
-        "owner": None,
-        "processed_count": 0,
-        "last_checkpoint_time": None,
-        "last_checkpoint_id": None,
-        "last_update_time": None,
-        "start_exec_time": None,
-        "finish_exec_time": None
-    })
-
-    logger.info(f"新增增量同步窗口：{start_time} 至 {end_time}")
-
-    total = 0
-    for idx, w in enumerate(cp_data["base_windows"]):
-        if w["status"] in ("pending", "in_progress"):
-            total += migrate_window(w, f"base_windows[{idx}]")
-
+    for table_key in TABLES_CONFIG.keys():
+        base_windows = cp_data.setdefault(table_key, {}).setdefault("base_windows", [])
+        last_end = max((w["end"] for w in base_windows), default="1970-01-01T00:00:00")
+        base_windows.append({
+            "start": last_end,
+            "end": end_time,
+            "status": "pending",
+            "mode": "incremental",  # <--- 修改點：明確記錄視窗模式
+            "processed_count": 0,
+            "last_checkpoint_time": None,
+            "last_checkpoint_id": None,
+            "last_mod_date": None,
+            "owner": None,
+            "start_exec_time": None,
+            "finish_exec_time": None
+        })
+        logger.info(f"新增 {table_key} 增量同步視窗：{last_end} ~ {end_time}")
     save_checkpoint(cp_data)
+    total = 0
+    for table_key in TABLES_CONFIG.keys():
+        for w in cp_data[table_key]["base_windows"]:
+            if w["status"] in ("pending", "in_progress"):
+                total += migrate_table_window(table_key, w, mode="incremental")
+    print(f"增量同步完成，共同步 {total} 筆記錄")
 
-    print(f"增量同步完成，遷移筆數: {total}")
-
-
-def command_correction(start_time, end_time, force=True):
+def command_correction(table_key, start_time, end_time):
     """
-    補寫同步（指定時間段）, 現僅保留強制補寫（覆蓋）模式。
+    強制補寫：針對指定表與時間視窗重做同步(mod_date)
     """
     global cp_data
-    cp_data.setdefault("correction_windows", [])
-    cp_data["correction_windows"].append({
+    corr = cp_data.setdefault(table_key, {}).setdefault("correction_windows", [])
+    corr.append({
         "start": start_time,
         "end": end_time,
         "status": "pending",
-        "owner": None,
+        "mode": "incremental",  # <--- 修改點：明確記錄視窗模式
         "processed_count": 0,
         "last_checkpoint_time": None,
         "last_checkpoint_id": None,
-        "last_update_time": None,
-        "resync": True,   # 永遠強制覆蓋
+        "last_mod_date": None,
+        "owner": None,
         "start_exec_time": None,
         "finish_exec_time": None
     })
     save_checkpoint(cp_data)
-    logger.info(f"新增補寫窗口：{start_time} 至 {end_time} 強制覆蓋=真")
-
+    logger.info(f"新增 {table_key} 補寫同步視窗：{start_time} ~ {end_time}")
     total = 0
-    for idx, w in enumerate(cp_data["correction_windows"]):
+    for w in corr:
         if w["status"] in ("pending", "in_progress"):
-            total += migrate_window(w, f"correction_windows[{idx}]")
-    print(f"補寫同步完成，遷移筆數: {total}")
-
+            total += migrate_table_window(table_key, w, mode="incremental")
+    print(f"{table_key} 補寫同步完成，共同步 {total} 筆記錄")
 
 def command_resume():
     """
-    針對所有狀態 pending/in_progress 的窗口恢復續傳
+    斷點恢復：繼續所有未完成視窗之同步任務
     """
     global cp_data
     total = 0
-    for wlist in ("base_windows", "correction_windows"):
-        for idx, w in enumerate(cp_data.get(wlist, [])):
-            if w["status"] in ("pending", "in_progress"):
-                total += migrate_window(w, f"{wlist}[{idx}]")
-    print(f"斷點恢復完成，遷移筆數: {total}")
-
+    for table_key in TABLES_CONFIG.keys():
+        for window_type in ("base_windows", "correction_windows"):
+            for w in cp_data[table_key].get(window_type, []):
+                if w["status"] in ("pending", "in_progress"):
+                    # --- 從這裡開始是修改點 ---
+                    # 1. 從視窗物件w中獲取其模式。
+                    # 2. 使用 .get() 是為了相容舊的、沒有mode欄位的checkpoint檔案，預設其為 "incremental"。
+                    mode_to_run = w.get("mode", "incremental")
+                    logger.info(f"Resuming window for '{table_key}' in '{mode_to_run}' mode. Window: {w['start']} -> {w['end']}")
+                    
+                    # 3. 將獲取到的正確模式傳遞給遷移函式。
+                    total += migrate_table_window(table_key, w, mode=mode_to_run)
+                    # --- 修改點結束 ---
+    print(f"斷點恢復完成，共同步 {total} 筆記錄")
 
 def command_show_status():
     """
-    顯示目前斷點與窗口同步狀態
+    顯示 checkpoint.json 目前狀態
     """
     global cp_data
     print(json.dumps(cp_data, ensure_ascii=False, indent=2))
 
-
 def command_reset():
     """
-    危險操作，重置所有斷點進度檔
+    重置所有斷點，請慎用
     """
-    confirm = input("警告：重置斷點將清除所有遷移進度且無法恢復，請輸入 Y 確認：")
+    confirm = input("警告：重置斷點將清除所有同步進度且無法恢復，請輸入 Y 確認：")
     if confirm.strip().upper() == "Y":
         if os.path.exists(CHECKPOINT_FILE):
             os.remove(CHECKPOINT_FILE)
@@ -699,92 +712,55 @@ def command_reset():
     else:
         print("操作已取消")
 
-
-def command_gen_report():
-    """
-    輸出各時間窗口同步進度摘要
-    """
-    global cp_data
-    print("====== 遷移狀態報告 ======")
-    for window_type in ("base_windows", "correction_windows"):
-        print(f"\n[{window_type}] 時間窗口:")
-        for w in cp_data.get(window_type, []):
-            print(f"  時段: {w['start']} ~ {w['end']}")
-            print(f"  狀態: {w['status']}, 已遷移筆數: {w.get('processed_count', 0)}")
-            print(f"  最後斷點時間: {w.get('last_checkpoint_time')}")
-            print(f"  最後斷點事件ID: {w.get('last_checkpoint_id')}")
-            print(f"  執行者: {w.get('owner')}")
-            print(f"  最後更新時間: {w.get('last_update_time')}")
-    print("============================")
-
-
-# ====== 命令列參數處理 =====
 def parse_args():
     """
-    解析命令列參數，支援各執行模式
+    解析命令列參數
     """
     parser = argparse.ArgumentParser(description="PostgreSQL → MongoDB 活動資料遷移工具")
     group = parser.add_mutually_exclusive_group(required=True)
     group.add_argument("--full-sync", action="store_true", help="全量同步")
     group.add_argument("--incremental", action="store_true", help="增量同步")
-    group.add_argument("--correction", action="store_true", help="強制補寫窗口")
+    group.add_argument("--correction", nargs=3, metavar=('TABLE', 'START', 'END'),
+                       help="補寫同步 eg: --correction attendees 2025-08-01T00:00:00 2025-08-01T03:00:00")
     group.add_argument("--resume", action="store_true", help="斷點恢復")
     group.add_argument("--show-status", action="store_true", help="查看斷點狀態")
-    group.add_argument("--gen-report", action="store_true", help="生成遷移報告")
     group.add_argument("--reset", action="store_true", help="重置所有斷點")
-
-    parser.add_argument("--start", type=str, default=None, help="補寫窗口起始時間（ISO8601格式）")
-    parser.add_argument("--end", type=str, default=None, help="結束時間（ISO8601格式或 now，預設當前時間）")
-    parser.add_argument("--force", action="store_true", help="強制補寫時必須加")
-
+    parser.add_argument("--end", type=str, default=None, help="截止時間 ISO格式或 now（增量/全量同步）")
     args = parser.parse_args()
-    if args.end is None:
+    if args.end is None or (isinstance(args.end, str) and args.end.lower() == "now"):
         args.end = datetime.datetime.now().isoformat()
-    elif isinstance(args.end, str) and args.end.lower() == "now":
-        args.end = datetime.datetime.now().isoformat()
-
-    if args.correction and (not args.start or not args.end):
-        parser.error("--correction 模式必須指定 --start 與 --end")
-
-    if args.force and not args.correction:
-        parser.error("--force 必須和 --correction 一起使用")
-
     return args
 
-
-# ===== 主進入點 =====
 def main():
-    args = parse_args()
     global cp_data
+    args = parse_args()
+    init_logger(mode='sync')
+    init_db_conn()
     cp_data = load_checkpoint()
-
-    if args.full_sync or args.incremental or args.correction or args.resume:
-        init_logger()
-        init_db_conn()
 
     if args.full_sync:
         command_full_sync(end_time=args.end)
     elif args.incremental:
         command_incremental(end_time=args.end)
     elif args.correction:
-        # 只保留強制補寫模式，force 參數必須提供且為 True，參數在命令列必須提供
-        command_correction(start_time=args.start, end_time=args.end, force=args.force)
+        table_key, start, end = args.correction
+        if table_key not in TABLES_CONFIG:
+            print(f"未知的 table: {table_key}")
+            sys.exit(1)
+        command_correction(table_key, start, end)
     elif args.resume:
         command_resume()
     elif args.show_status:
         command_show_status()
-    elif args.gen_report:
-        command_gen_report()
     elif args.reset:
         command_reset()
     else:
         print("請指定有效參數，使用 --help 查看說明")
 
-    if LOG_FILE:
-        print("\n🔍 本次遷移日誌文件:")
-        print(os.path.abspath(LOG_FILE))
-        print(f"使用命令查看日誌：tail -f {os.path.abspath(LOG_FILE)}\n")
+    verify_consistency()
 
+    if LOG_FILE:
+        print(f"\n日誌檔案：{os.path.abspath(LOG_FILE)}，可用 tail -f 查看")
 
 if __name__ == "__main__":
     main()
