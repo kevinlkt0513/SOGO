@@ -18,6 +18,7 @@ import json
 import logging
 import datetime
 import argparse
+import re # ##### 修改開始 #####: 為了駝峰轉換新增
 
 import psycopg2
 from psycopg2.extras import DictCursor
@@ -74,7 +75,7 @@ TABLES_CONFIG = {
         "mod_date_field": "mod_date",
         "id_field": "event_no",
         "mongo_collection": "events",
-        "verification_mode": "merge_source"   # 這是合併資料來源
+        "verification_mode": "merge_source"    # 這是合併資料來源
     },
     "attendees": {
         "pg_table": "gif_hcc_event_attendee",
@@ -152,17 +153,19 @@ def ensure_mongodb_indexes(mdb):
     """
     logger.info("開始檢查並建立 MongoDB 索引...")
     try:
-        # 1. events 集合的索引
+        # ##### 修改開始 #####
+        # 1. events 集合的索引 (欄位改為駝峰)
         events_collection = mdb["events"]
-        event_no_index = IndexModel([("event_no", 1)], name="idx_event_no")
+        event_no_index = IndexModel([("eventNo", 1)], name="idx_eventNo")
         events_collection.create_indexes([event_no_index])
-        logger.info(f"成功檢查/建立 events 集合的索引: idx_event_no")
+        logger.info(f"成功檢查/建立 events 集合的索引: idx_eventNo")
 
-        # 2. event_attendees 集合的索引 (最關鍵)
+        # 2. event_attendees 集合的索引 (欄位改為駝峰)
         attendees_collection = mdb["event_attendees"]
         attendee_compound_index = IndexModel([("eventNo", 1), ("appId", 1)], name="idx_eventNo_appId")
         attendees_collection.create_indexes([attendee_compound_index])
         logger.info(f"成功檢查/建立 event_attendees 集合的索引: idx_eventNo_appId")
+        # ##### 修改結束 #####
         
         logger.info("MongoDB 索引檢查完畢。")
     except Exception as e:
@@ -230,8 +233,8 @@ def init_db_conn():
         sys.exit(1)
 
 def fetch_batch(table_key, start_time, end_time,
-                last_checkpoint_time=None, last_checkpoint_id=None,
-                batch_size=100, mode="incremental"):
+                  last_checkpoint_time=None, last_checkpoint_id=None,
+                  batch_size=100, mode="incremental"):
     """
     批次擷取指定表於時間視窗內之資料
     - ★★★ 恢復邏輯：不再使用白名單過濾 ★★★
@@ -295,11 +298,43 @@ def normalize_value(v):
     # 其他類型直接返回
     return v
 
-def normalize_row(row):
+# ##### 修改開始 #####
+def snake_to_camel(snake_str):
     """
-    將 DictCursor 返回的 row 中所有值做 normalize
+    將 snake_case 轉換為 camelCase
     """
-    return {k: normalize_value(v) for k, v in row.items()}
+    if not isinstance(snake_str, str):
+        return snake_str
+    components = snake_str.split('_')
+    return components[0] + ''.join(x.title() for x in components[1:])
+
+def transform_row_to_doc(row):
+    """
+    將從 PG 獲取的單行數據 DictRow 進行完整轉換：
+    1. 欄位名轉為 camelCase
+    2. 'Y'/'N' 轉為布林值
+    3. 處理 Decimal/Date/Datetime 等特殊類型
+    """
+    doc = {}
+    for key, value in row.items():
+        camel_key = snake_to_camel(key)
+        
+        # 預設值為原始值
+        transformed_value = value
+
+        # 規則 2: 將 "Y"/"N" 標誌轉換為布爾值
+        if isinstance(value, str):
+            if value.upper() == 'Y':
+                transformed_value = True
+            elif value.upper() == 'N':
+                transformed_value = False
+        
+        # 規則 3: 使用既有的 normalize_value 處理特殊類型
+        doc[camel_key] = normalize_value(transformed_value)
+        
+    return doc
+# ##### 修改結束 #####
+
 
 def upsert_batch(table_key, rows):
     """
@@ -308,24 +343,61 @@ def upsert_batch(table_key, rows):
     conf = TABLES_CONFIG[table_key]
     requests = []
     for row in rows:
-        # 先調用 normalize_row 轉換所有欄位
-        doc = normalize_row(row)
+        # ##### 修改開始 #####
+        # 使用新的轉換函數處理每一行數據
+        doc = transform_row_to_doc(row)
 
         if "embed_array_field" in conf:
             # 嵌入陣列更新：使用 $addToSet 避免重複
-            filter_cond = {"event_no": doc["event_no"]}
-            requests.append(UpdateOne(
-                filter_cond,
-                {"$addToSet": {conf["embed_array_field"]: doc}},
-                upsert=True
-            ))
-        else:
-            # 單文件 upsert
-            if table_key == "attendees":
-                filter_cond = {"eventNo": doc.get("event_no"), "appId": doc.get("app_id")}
+            # 過濾條件和欄位名都使用 camelCase
+            array_field = conf["embed_array_field"]
+            event_no = doc.get("eventNo")
+            if not event_no:
+                logger.warning(f"在 {table_key} 表的記錄中找不到 eventNo，數據: {doc}")
+                continue
+            
+            filter_cond = {"eventNo": event_no}
+
+            # 規則 3 & 4: 對 usingBranchIds 和 memberTypes 進行規範化
+            if array_field == "usingBranchIds":
+                branch_id = doc.get("branch")
+                if branch_id:
+                    requests.append(UpdateOne(
+                        filter_cond,
+                        {"$addToSet": {array_field: branch_id}},
+                        upsert=True
+                    ))
+            elif array_field == "memberTypes":
+                member_type = doc.get("memberType")
+                if member_type:
+                    requests.append(UpdateOne(
+                        filter_cond,
+                        {"$addToSet": {array_field: member_type}},
+                        upsert=True
+                    ))
             else:
-                filter_cond = {conf["id_field"]: doc[conf["id_field"]]}
+                # 其他嵌入陣列欄位的標準處理方式 (例如 prizeCouponJson)
+                requests.append(UpdateOne(
+                    filter_cond,
+                    {"$addToSet": {array_field: doc}},
+                    upsert=True
+                ))
+        else:
+            # 單文件 upsert (所有欄位名均已轉換為 camelCase)
+            id_field_camel = snake_to_camel(conf["id_field"])
+            
+            if table_key == "attendees":
+                # attendees 使用複合鍵
+                filter_cond = {"eventNo": doc.get("eventNo"), "appId": doc.get("appId")}
+            else:
+                # 其他表使用單一主鍵
+                if id_field_camel not in doc:
+                    logger.warning(f"在 {table_key} 表的記錄中找不到主鍵 {id_field_camel}，數據: {doc}")
+                    continue
+                filter_cond = {id_field_camel: doc[id_field_camel]}
+
             requests.append(UpdateOne(filter_cond, {"$set": doc}, upsert=True))
+        # ##### 修改結束 #####
 
     if not requests:
         # 建立一個模擬的 result 物件，以便呼叫端統一處理
@@ -419,7 +491,7 @@ def migrate_table_window(table_key, window, mode="incremental"):
 
             id_key_value = last_row.get(conf["id_field"])
 
-            # 防御性检查
+            # 防御性檢查
             if time_key_value is None or id_key_value is None:
                 logger.error(
                     f"{table_key} 無法獲取有效的斷點值，時間: {time_key_value}, ID: {id_key_value}，最後一行數據: {last_row}"
@@ -713,13 +785,13 @@ def log_summary_report(start_time, end_time, task_name):
     logger.info("=" * 60)
     logger.info("")
     logger.info("[ 總體概覽 (Overall) ]")
-    logger.info(f"  - 任務狀態:           {status_str}")
-    logger.info(f"  - 任務名稱:           {task_name}")
-    logger.info(f"  - 開始時間:           {start_time.strftime('%Y-%m-%d %H:%M:%S')}")
-    logger.info(f"  - 結束時間:           {end_time.strftime('%Y-%m-%d %H:%M:%S')}")
-    logger.info(f"  - 總耗時:             {duration_str}")
+    logger.info(f"  - 任務狀態:               {status_str}")
+    logger.info(f"  - 任務名稱:               {task_name}")
+    logger.info(f"  - 開始時間:               {start_time.strftime('%Y-%m-%d %H:%M:%S')}")
+    logger.info(f"  - 結束時間:               {end_time.strftime('%Y-%m-%d %H:%M:%S')}")
+    logger.info(f"  - 總耗時:                   {duration_str}")
     logger.info(f"  - 總處理 PostgreSQL 紀錄數: {total_records:,} 筆")
-    logger.info(f"  - 平均吞吐量:           {throughput:.1f} 筆/秒")
+    logger.info(f"  - 平均吞吐量:               {throughput:.1f} 筆/秒")
     logger.info("")
     
     logger.info("[ 分表處理詳情 (Per-Table Details) ]")
@@ -734,7 +806,7 @@ def log_summary_report(start_time, end_time, task_name):
 
     logger.info("[ 資料一致性校驗 (Data Consistency Verification) ]")
     if not MIGRATION_STATS["verification_results"]:
-         logger.info("  - 本次任務未執行資料校驗。")
+            logger.info("  - 本次任務未執行資料校驗。")
     else:
         for result in MIGRATION_STATS["verification_results"]:
             logger.info(f"  - {result}")
