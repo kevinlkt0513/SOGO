@@ -49,7 +49,7 @@ CHECKPOINT_FILE = "migration_checkpoint.json"
 LOG_DIR = "logs"
 LOG_FILE = None
 logger = None
-args = None # 全域變數，用於儲存命令列參數
+args = None
 
 # --- 新增這個全域統計變數 ---
 MIGRATION_STATS = {
@@ -79,11 +79,15 @@ TABLES_CONFIG = {
         "id_field": "id", "mongo_collection": "events", "embed_array_field": "usingBranchIds",
         "verification_mode": "embed_array"
     },
-    "coupon_setting": {
-        "pg_table": "gif_event_coupon_setting", "add_date_field": "add_date", "mod_date_field": "mod_date",
-        "id_field": "coupon_setting_no", "mongo_collection": "events", "embed_array_field": "prizeCouponJson",
-        "verification_mode": "embed_array"
-    },
+    # --- 【核心修正】---
+    # 根據客戶要求，不再合併 gif_event_coupon_setting 表的資料到 prizeCouponJson。
+    # 為了實現這一點，我們直接註解掉 coupon_setting 的處理設定。
+    # 這意味著來自 gif_event_coupon_setting 的資料將完全不會被遷移。
+    # "coupon_setting": {
+    #     "pg_table": "gif_event_coupon_setting", "add_date_field": "add_date", "mod_date_field": "mod_date",
+    #     "id_field": "coupon_setting_no", "mongo_collection": "events", "embed_array_field": "prizeCouponJson",
+    #     "verification_mode": "embed_array"
+    # },
     "member_types": {
         "pg_table": "gif_hcc_event_member_type", "add_date_field": "add_date", "mod_date_field": "mod_date",
         "id_field": "id", "mongo_collection": "events", "embed_array_field": "memberTypes",
@@ -238,19 +242,12 @@ def transform_row_to_doc(row):
                 transformed_value = True
             elif value.upper() == 'N':
                 transformed_value = False
-        if camel_key == 'prizeCouponJson' and isinstance(transformed_value, str):
-            if not transformed_value:
-                transformed_value = []
-            else:
-                try:
-                    parsed_data = json.loads(transformed_value)
-                    if isinstance(parsed_data, list):
-                        transformed_value = parsed_data
-                    else:
-                        transformed_value = [parsed_data]
-                except json.JSONDecodeError:
-                    print(f"警告：在 eventNo={row.get('event_no')} 中發現無效的 prizeCouponJson 字符串，將其設置為空陣列。內容: {transformed_value[:100]}")
-                    transformed_value = []
+        
+        # --- 【核心修正】---
+        # 根據客戶要求，不再將 prizeCouponJson 的字串解析為陣列。
+        # 此處已移除相關的 json.loads() 邏輯。
+        # 現在該欄位會被當作普通字串直接傳遞。
+        
         doc[camel_key] = normalize_value(transformed_value)
     return doc
 
@@ -397,17 +394,8 @@ def verify_consistency():
         mode = conf.get("verification_mode", "primary_count")
         pg_table_name = conf['pg_table']
         pg_count = 0
-        if key == "coupon_setting":
-            logger.info(f"[{key}] 執行 coupon_setting 的特殊合併計數邏輯...")
-            sql_a = f"SELECT SUM(json_array_length(prize_coupon_json::json)) FROM {SCHEMA}.gif_hcc_event WHERE prize_coupon_json IS NOT NULL AND prize_coupon_json LIKE '[%]';"
-            pg_cursor.execute(sql_a)
-            count_a = pg_cursor.fetchone()[0] or 0
-            sql_b = f"SELECT COUNT(*) FROM {SCHEMA}.{pg_table_name};"
-            pg_cursor.execute(sql_b)
-            count_b = pg_cursor.fetchone()[0] or 0
-            pg_count = int(count_a) + int(count_b)
-            logger.info(f"[{key}] PG 理論總數: (來自 gif_hcc_event.prize_coupon_json 的 {count_a}) + (來自 {pg_table_name} 的 {count_b}) = {pg_count}")
-        elif key == "coupon_burui":
+
+        if key == "coupon_burui":
             logger.info(f"[{key}] 執行 coupon_burui 的特殊去重計數邏輯...")
             sql = f"SELECT COUNT(*) FROM (SELECT DISTINCT s.event_no, t.branch FROM {SCHEMA}.{pg_table_name} t INNER JOIN {SCHEMA}.gif_event_coupon_setting s ON t.coupon_setting_no = s.coupon_setting_no WHERE t.branch IS NOT NULL AND t.branch != '') AS distinct_rows;"
             pg_cursor.execute(sql)
