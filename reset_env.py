@@ -15,6 +15,7 @@ from dotenv import load_dotenv
 
 # ========== 環境與設定 ==========
 load_dotenv(".env.dev", override=True)  # 或指定其他環境檔
+print("ENVIRONMENT =", os.getenv("ENVIRONMENT"))
 
 LOG_DIR = "logs"
 CHECKPOINT_FILE = "migration_checkpoint.json"
