@@ -7,7 +7,7 @@ PostgreSQL → MongoDB 活動資料遷移工具（生产环境最终修正版）
 - 功能：
   - 支援全量同步(--full-sync)與增量同步(--incremental)，所有操作均受白名單過濾。
   - 智慧增量同步：精確繼承上次成功任务的资料断点，作為本次增量起點，確保無遺漏。
-  - checkpoint.json 集中管理狀態，支援斷點續傳(--resume)。
+  - checkpoint.json 集中管理狀態，支援斷點續傳(--resume)，並可透過 --show-status 和 --reset 進行管理。
   - 資料一致性校驗邏輯與遷移邏輯完全對齊，並在失敗時自動輸出差異ID。
   - 詳細的日誌記錄與任務總結報告。
 """
@@ -19,6 +19,7 @@ import logging
 import datetime
 import argparse
 from typing import Set
+from collections import defaultdict
 
 import psycopg2
 from psycopg2.extras import DictCursor
@@ -188,9 +189,7 @@ def load_valid_event_nos():
     else:
         logger.info(f"白名單載入完畢，共 {len(VALID_EVENT_NOS)} 個有效的 event_no。")
 
-def fetch_batch(table_key, start_time, end_time,
-                  last_checkpoint_time=None, last_checkpoint_id=None,
-                  batch_size=100, mode="incremental"):
+def fetch_batch(table_key, end_time, last_checkpoint_time, last_checkpoint_id, batch_size=100):
     conf = TABLES_CONFIG[table_key]
     pg_table_alias = "t"
     join_clause = ""
@@ -200,12 +199,10 @@ def fetch_batch(table_key, start_time, end_time,
         join_clause = f"JOIN {SCHEMA}.gif_event_coupon_setting s ON {pg_table_alias}.coupon_setting_no = s.coupon_setting_no"
         select_clause = f"SELECT {pg_table_alias}.*, s.event_no FROM {SCHEMA}.{conf['pg_table']} {pg_table_alias}"
 
-    date_field_str = conf['add_date_field']
-    mod_date_field_str = conf['mod_date_field']
-    id_field_str = conf['id_field']
+    effective_timestamp_field = f"COALESCE({pg_table_alias}.{conf['mod_date_field']}, {pg_table_alias}.{conf['add_date_field']}, '1970-01-01')"
+    id_field_with_alias = f"{pg_table_alias}.{conf['id_field']}"
     
-    date_field_coalesce = f"COALESCE({pg_table_alias}.{mod_date_field_str}, {pg_table_alias}.{date_field_str}, '1970-01-01')"
-    order_by_clause = f"ORDER BY {date_field_coalesce}, {pg_table_alias}.{id_field_str}"
+    order_by_clause = f"ORDER BY {effective_timestamp_field}, {id_field_with_alias}"
 
     params = []
     where_clauses = []
@@ -219,17 +216,17 @@ def fetch_batch(table_key, start_time, end_time,
     else:
         where_clauses.append("1=0") 
     
-    where_clauses.append(f"{date_field_coalesce} < %s")
+    where_clauses.append(f"{effective_timestamp_field} < %s")
     params.append(end_time)
-    id_field_with_alias = f"{pg_table_alias}.{id_field_str}"
+    
     if last_checkpoint_time and last_checkpoint_id is not None:
-        where_clauses.append(f"({date_field_coalesce} > %s OR ({date_field_coalesce} = %s AND {id_field_with_alias} > %s))")
+        where_clauses.append(f"({effective_timestamp_field} > %s OR ({effective_timestamp_field} = %s AND {id_field_with_alias} > %s))")
         params.extend([last_checkpoint_time, last_checkpoint_time, last_checkpoint_id])
 
     full_sql = f"{select_clause} {join_clause} WHERE {' AND '.join(where_clauses)} {order_by_clause} LIMIT %s"
     params.append(batch_size)
     
-    logger.info(f"[SQL-{table_key}] {full_sql.replace(chr(10), ' ')}")
+    # logger.info(f"[SQL-{table_key}] {full_sql.replace(chr(10), ' ')}")
     pg_cursor.execute(full_sql, params)
     return pg_cursor.fetchall()
 
@@ -292,44 +289,49 @@ def upsert_batch(table_key, rows):
     
     return mongo_dbs[table_key].bulk_write(requests, ordered=False)
 
-def update_checkpoint(table_key, last_time_iso, last_id, processed_count, window, status=None):
+def update_checkpoint_window(table_key, window_to_update, new_checkpoint_time, new_checkpoint_id, processed_count_delta, status):
     global cp_data
     cp_table = cp_data.setdefault(table_key, {})
-    cp_table["last_checkpoint_time"] = last_time_iso
-    cp_table["last_checkpoint_id"] = str(last_id)
+    
     for w in cp_table.setdefault("base_windows", []):
-        if w["start"] == window["start"] and w["end"] == window["end"]:
+        if w["start"] == window_to_update["start"] and w["end"] == window_to_update["end"] and w.get("mode") == window_to_update.get("mode"):
             w.update({
-                "last_checkpoint_time": last_time_iso,
-                "last_checkpoint_id": str(last_id),
-                "processed_count": processed_count,
-                "owner": os.uname().nodename.split('.')[0]
+                "last_checkpoint_time": new_checkpoint_time,
+                "last_checkpoint_id": str(new_checkpoint_id) if new_checkpoint_id is not None else None,
+                "processed_count": w.get("processed_count", 0) + processed_count_delta,
+                "owner": os.uname().nodename.split('.')[0],
+                "status": status
             })
-            if status: w["status"] = status
-            if status == "completed": w["finish_exec_time"] = datetime.datetime.now(timezone.utc).isoformat()
+            if status == "completed": 
+                w["finish_exec_time"] = datetime.datetime.now(timezone.utc).isoformat()
             break
     save_checkpoint(cp_data)
 
-def migrate_table_window(table_key, window, mode="full"):
+def migrate_table_window(table_key, window):
     conf = TABLES_CONFIG[table_key]
-    start, end = window["start"], window["end"]
-    last_t_iso, last_id = window.get("last_checkpoint_time"), window.get("last_checkpoint_id")
-    processed = window.get("processed_count", 0)
-    initial_processed = processed
-    window.update({"status": "in_progress", "start_exec_time": datetime.datetime.now(timezone.utc).isoformat()})
-    save_checkpoint(cp_data)
+    
+    last_t_iso = window.get("last_checkpoint_time")
+    last_id = window.get("last_checkpoint_id")
+    
+    processed_since_resume = 0
     consecutive_errors = 0
+    
+    update_checkpoint_window(table_key, window, last_t_iso, last_id, 0, status="in_progress")
+    
     while True:
         try:
-            rows = fetch_batch(table_key, start, end, last_t_iso, last_id, BATCH_SIZE, mode=mode)
+            rows = fetch_batch(table_key, window["end"], last_t_iso, last_id, BATCH_SIZE)
+            
             if not rows:
-                update_checkpoint(table_key, last_t_iso, last_id, processed, window, status="completed")
-                logger.info(f"{table_key} 視窗 {start}~{end} 同步完成，本次處理 {processed - initial_processed} 筆")
+                update_checkpoint_window(table_key, window, last_t_iso, last_id, 0, status="completed")
+                total_processed = window.get("processed_count", 0)
+                logger.info(f"{table_key} 視窗 {window['start']}~{window['end']} 同步完成，本次執行處理了 {processed_since_resume} 筆，累計處理 {total_processed} 筆")
                 break
             
             result = upsert_batch(table_key, rows)
             
             processed_this_batch = len(rows)
+            
             inserted = result.upserted_count if result else 0
             updated = result.modified_count if result else 0
             if "embed_array_field" in conf or table_key == "hcc_events":
@@ -343,7 +345,6 @@ def migrate_table_window(table_key, window, mode="full"):
             MIGRATION_STATS["total_inserted"] += inserted
             MIGRATION_STATS["total_updated"] += updated
 
-            processed += processed_this_batch
             last_row = rows[-1]
             time_key_value = last_row.get(conf["mod_date_field"]) or last_row.get(conf["add_date_field"])
             id_key_value = last_row.get(conf["id_field"])
@@ -354,19 +355,20 @@ def migrate_table_window(table_key, window, mode="full"):
             last_t_iso = normalize_value(time_key_value).isoformat()
             last_id = id_key_value
             
-            update_checkpoint(table_key, last_t_iso, last_id, processed, window, status="in_progress")
+            update_checkpoint_window(table_key, window, last_t_iso, last_id, processed_this_batch, status="in_progress")
+            processed_since_resume += processed_this_batch
             logger.info(f"{table_key} 批次同步成功: records={len(rows)}, last_time={last_t_iso}, last_id={last_id}")
             consecutive_errors = 0
+            
         except psycopg2.Error as pg_err:
             consecutive_errors += 1
             logger.error(f"PostgreSQL 發生錯誤，正在回滾事務: {pg_err}")
             pg_conn.rollback()
         except Exception as e:
             consecutive_errors += 1
-            logger.error(f"{table_key} 視窗 {start}~{end} 同步批次異常，第 {consecutive_errors} 次錯誤: {e}", exc_info=True)
+            logger.error(f"{table_key} 視窗同步批次異常，第 {consecutive_errors} 次錯誤: {e}", exc_info=True)
             if consecutive_errors >= 5:
-                window["status"] = "pending"
-                save_checkpoint(cp_data)
+                update_checkpoint_window(table_key, window, last_t_iso, last_id, 0, status="pending")
                 logger.error(f"{table_key} 視窗因連續錯誤而終止，狀態已改為 pending。")
                 raise e
             
@@ -503,71 +505,148 @@ def command_full_sync():
     cp_data = {}
     end_time = "9999-12-31T23:59:59Z"
     for table_key in TABLES_CONFIG.keys():
-        cp_data.setdefault(table_key, {}).setdefault("base_windows", []).append({
-            "start": "1970-01-01T00:00:00Z", "end": end_time, "status": "pending", "mode": "full"
-        })
+        window = {
+            "start": "1970-01-01T00:00:00Z", 
+            "end": end_time, 
+            "status": "pending", 
+            "mode": "full",
+            "last_checkpoint_time": "1970-01-01T00:00:00Z",
+            "last_checkpoint_id": None,
+            "processed_count": 0
+        }
+        cp_data.setdefault(table_key, {}).setdefault("base_windows", []).append(window)
+
     save_checkpoint(cp_data)
     logger.info(f"已為所有表建立/重置全量同步視窗。")
+    
     execution_order = ["events", "hcc_events", "attendees", "coupon_burui", "member_types"]
     for table_key in execution_order:
         logger.info(f"--- 開始處理表: {table_key} ---")
         window = cp_data[table_key]["base_windows"][0]
-        migrate_table_window(table_key, window, mode="full")
+        migrate_table_window(table_key, window)
+
+def get_latest_checkpoint_for_table(table_key):
+    """
+    從 checkpoint 檔案中，只查找【指定表】的已完成任務，並返回其最新的斷點。
+    """
+    latest_checkpoint_time = "1970-01-01T00:00:00Z"
+    latest_checkpoint_id = None
+    
+    current_cp_data = load_checkpoint()
+    
+    table_windows = current_cp_data.get(table_key, {}).get("base_windows", [])
+    completed_windows = [w for w in table_windows if w.get("status") == "completed"]
+
+    if completed_windows:
+        latest_window = max(completed_windows, key=lambda w: w.get("finish_exec_time", "1970-01-01T00:00:00Z"))
+        latest_checkpoint_time = latest_window.get("last_checkpoint_time", "1970-01-01T00:00:00Z")
+        latest_checkpoint_id = latest_window.get("last_checkpoint_id")
+    
+    return latest_checkpoint_time, latest_checkpoint_id
 
 def command_incremental():
     global cp_data
     end_time_utc = datetime.datetime.now(timezone.utc)
-    
-    latest_checkpoint_time = None
-    latest_checkpoint_id = None
-    
-    all_completed_windows = []
-    for key in TABLES_CONFIG.keys():
-        all_completed_windows.extend([w for w in cp_data.get(key, {}).get("base_windows", []) if w.get("status") == "completed"])
-
-    if all_completed_windows:
-        latest_window = max(all_completed_windows, key=lambda w: w.get("finish_exec_time", "1970-01-01T00:00:00Z"))
-        latest_checkpoint_time = latest_window.get("last_checkpoint_time")
-        latest_checkpoint_id = latest_window.get("last_checkpoint_id")
-
-    start_time_str = latest_checkpoint_time if latest_checkpoint_time else "1970-01-01T00:00:00Z"
-    if not latest_checkpoint_time:
-        logger.warning("在 checkpoint 中未找到任何已完成的任務斷點，增量同步將從 1970-01-01 開始。")
-        
     execution_order = ["events", "hcc_events", "attendees", "coupon_burui", "member_types"]
+
+    # *** 最終核心邏輯修正 ***
+    # 廢除「全局斷點」，改為在循環中為【每個表】獨立查找其自身的最新斷點。
+    # 這確保了每個表的進度是獨立維護的，從根本上避免了數據類型污染問題。
     for table_key in execution_order:
+        logger.info(f"--- 正在為表 '{table_key}' 準備增量任務 ---")
+        
+        # 1. 為當前表獨立查找其最新的斷點
+        latest_checkpoint_time, latest_checkpoint_id = get_latest_checkpoint_for_table(table_key)
+        
+        # 2. 重新從磁碟加載 checkpoint 檔案，以防被其他進程修改
+        cp_data = load_checkpoint()
         table_data = cp_data.setdefault(table_key, {})
         base_windows = table_data.setdefault("base_windows", [])
+        
+        # 3. 創建新的任務窗口，起點是【該表自己】的最新斷點
         new_window = {
-            "start": start_time_str, "end": end_time_utc.isoformat(), "status": "pending", 
-            "mode": "incremental", "last_checkpoint_time": latest_checkpoint_time, 
-            "last_checkpoint_id": latest_checkpoint_id
+            "start": latest_checkpoint_time, 
+            "end": end_time_utc.isoformat(), 
+            "status": "pending", 
+            "mode": "incremental", 
+            "last_checkpoint_time": latest_checkpoint_time, 
+            "last_checkpoint_id": latest_checkpoint_id,
+            "processed_count": 0
         }
         base_windows.append(new_window)
-        logger.info(f"新增 {table_key} 增量同步視窗：{new_window['start']} ~ {new_window['end']} (繼承斷點)")
+        logger.info(f"新增 {table_key} 增量同步視窗：{new_window['start']} ~ {new_window['end']} (繼承【自身】斷點)")
         save_checkpoint(cp_data)
-        migrate_table_window(table_key, new_window, mode="incremental")
+        
+        # 4. 執行同步
+        migrate_table_window(table_key, new_window)
 
 def command_resume():
     logger.info("開始執行斷點恢復任務...")
     execution_order = ["events", "hcc_events", "attendees", "coupon_burui", "member_types"]
     for table_key in execution_order:
-        if table_key not in cp_data: continue
-        for w in cp_data[table_key].get("base_windows", []):
+        current_cp_data = load_checkpoint()
+        if table_key not in current_cp_data: continue
+        
+        for w in current_cp_data[table_key].get("base_windows", []):
             if w.get("status") in ("pending", "in_progress"):
-                mode = w.get("mode", "full")
-                logger.info(f"恢復處理 '{table_key}' 的 {mode} 模式視窗: {w['start']} -> {w['end']}")
-                migrate_table_window(table_key, w, mode=mode)
+                logger.info(f"恢復處理 '{table_key}' 的 {w.get('mode', 'full')} 模式視窗: {w['start']} -> {w['end']}")
+                global cp_data
+                cp_data = current_cp_data
+                migrate_table_window(table_key, w)
+
+def command_show_status():
+    """顯示當前 checkpoint 狀態"""
+    logger.info("="*25 + " [ Checkpoint 狀態報告 ] " + "="*25)
+    if not cp_data:
+        logger.info("Checkpoint 檔案為空或不存在。")
+        return
+
+    summary = defaultdict(lambda: {"completed": 0, "in_progress": 0, "pending": 0})
+    
+    logger.info("[ 各表獨立最新斷點 (Latest Checkpoint per Table) ]")
+    for table_key in TABLES_CONFIG.keys():
+        latest_time, latest_id = get_latest_checkpoint_for_table(table_key)
+        logger.info(f"  - {table_key}:")
+        logger.info(f"    > 最新斷點時間: {latest_time or 'N/A'}")
+        logger.info(f"    > 最新斷點ID:    {latest_id or 'N/A'}")
+
+        table_data = cp_data.get(table_key, {})
+        for w in table_data.get("base_windows", []):
+            status = w.get("status", "unknown")
+            summary[table_key][status] += 1
+    
+    logger.info("")
+    logger.info("[ 各表任務窗口狀態 (Window Status per Table) ]")
+    for table, statuses in summary.items():
+        if statuses:
+            logger.info(f"  - {table}:")
+            for status, count in statuses.items():
+                logger.info(f"    > {status}: {count} 個窗口")
+    logger.info("="*67)
+
+
+def command_reset():
+    """重置 checkpoint 檔案"""
+    logger.warning(f"警告：這個操作將會刪除 checkpoint 檔案 '{CHECKPOINT_FILE}'。")
+    user_input = input("請輸入 'reset' 來確認執行此操作: ")
+    if user_input == 'reset':
+        if os.path.exists(CHECKPOINT_FILE):
+            os.remove(CHECKPOINT_FILE)
+            logger.info(f"Checkpoint 檔案 '{CHECKPOINT_FILE}' 已被成功刪除。")
+        else:
+            logger.info("Checkpoint 檔案不存在，無需操作。")
+    else:
+        logger.info("操作已取消。")
 
 def parse_args():
     parser = argparse.ArgumentParser(description="PostgreSQL → MongoDB 活動資料遷移工具 (Production Ready)")
     group = parser.add_mutually_exclusive_group(required=True)
-    group.add_argument("--full-sync", action="store_true")
-    group.add_argument("--incremental", action="store_true")
-    group.add_argument("--resume", action="store_true")
-    group.add_argument("--show-status", action="store_true")
-    group.add_argument("--reset", action="store_true")
-    parser.add_argument("--skip-pg-index-check", action="store_true")
+    group.add_argument("--full-sync", action="store_true", help="執行一次全新的全量同步，會清空進度。")
+    group.add_argument("--incremental", action="store_true", help="從上次的斷點開始執行增量同步。")
+    group.add_argument("--resume", action="store_true", help="恢復處理狀態為 'pending' 或 'in_progress' 的任務。")
+    group.add_argument("--show-status", action="store_true", help="顯示當前 checkpoint 的狀態摘要。")
+    group.add_argument("--reset", action="store_true", help="重置(刪除) checkpoint 檔案，以便從頭開始。")
+    parser.add_argument("--skip-pg-index-check", action="store_true", help="跳過啟動時的 PostgreSQL 索引檢查。")
     return parser.parse_args()
 
 def log_summary_report(start_time, end_time, task_name):
@@ -580,9 +659,11 @@ def log_summary_report(start_time, end_time, task_name):
     throughput = (total_records / total_seconds) if total_seconds > 0 else 0
     verification_results = MIGRATION_STATS.get("verification_results", [])
     has_failures = any("FAIL" in result for result in verification_results)
+    
     status_str = "失敗" if has_failures else "成功完成"
     if not has_failures and task_name not in ["show-status", "reset"]:
         status_str += " (所有校驗均通過)"
+
     report_lines = [
         "=" * 60, "========== [ 遷移任務總結報告 (Migration Summary) ] ==========", "=" * 60, "",
         "[ 總體概覽 (Overall) ]",
@@ -591,23 +672,27 @@ def log_summary_report(start_time, end_time, task_name):
         f"  - 開始時間:               {start_time.strftime('%Y-%m-%d %H:%M:%S')}",
         f"  - 結束時間:               {end_time.strftime('%Y-%m-%d %H:%M:%S')}",
         f"  - 總耗時:                   {duration_str}",
-        f"  - 總處理 PostgreSQL 紀錄數: {total_records:,} 筆",
-        f"  - 平均吞吐量:               {throughput:.1f} 筆/秒", "",
-        "[ 分表處理詳情 (Per-Table Details) ]"
     ]
-    if not MIGRATION_STATS.get("tables"):
-        report_lines.append("  - 本次任務未處理任何資料。")
-    else:
-        for key, stats in MIGRATION_STATS["tables"].items():
-            pg_table_name = TABLES_CONFIG[key]['pg_table']
-            report_lines.append(f"  - {pg_table_name} ({key}):")
-            report_lines.append(f"    > PG 來源: {stats.get('pg_records', 0):,} | Mongo 新增: {stats.get('inserted', 0):,} | Mongo 更新: {stats.get('updated', 0):,}")
-    report_lines.extend(["", "[ 資料一致性校驗 (Data Consistency Verification) ]"])
-    if not verification_results:
-        report_lines.append("  - 本次任務未執行資料校驗。")
-    else:
-        for result in verification_results:
-            report_lines.append(f"  - {result}")
+    if task_name not in ["show-status", "reset"]:
+        report_lines.extend([
+            f"  - 總處理 PostgreSQL 紀錄數: {total_records:,} 筆",
+            f"  - 平均吞吐量:               {throughput:.1f} 筆/秒", ""
+        ])
+        report_lines.append("[ 分表處理詳情 (Per-Table Details) ]")
+        if not MIGRATION_STATS.get("tables"):
+            report_lines.append("  - 本次任務未處理任何資料。")
+        else:
+            for key, stats in MIGRATION_STATS["tables"].items():
+                pg_table_name = TABLES_CONFIG[key]['pg_table']
+                report_lines.append(f"  - {pg_table_name} ({key}):")
+                report_lines.append(f"    > PG 來源: {stats.get('pg_records', 0):,} | Mongo 新增: {stats.get('inserted', 0):,} | Mongo 更新: {stats.get('updated', 0):,}")
+        report_lines.extend(["", "[ 資料一致性校驗 (Data Consistency Verification) ]"])
+        if not verification_results:
+            report_lines.append("  - 本次任務未執行資料校驗。")
+        else:
+            for result in verification_results:
+                report_lines.append(f"  - {result}")
+
     report_lines.extend(["", "=" * 25 + " [ 報告結束 ] " + "=" * 25])
     for line in report_lines: logger.info(line)
 
@@ -620,21 +705,24 @@ def main():
     init_logger(task_name=task_name)
     logger.info(f"===== 開始執行遷移任務: {task_name} =====")
     
-    if args.show_status or args.reset:
-        cp_data = load_checkpoint()
-        if args.show_status: command_show_status()
-        elif args.reset: command_reset()
-        return
-
     try:
+        if args.show_status or args.reset:
+            cp_data = load_checkpoint()
+            if args.show_status: command_show_status()
+            elif args.reset: command_reset()
+            return
+
         init_db_conn()
         cp_data = load_checkpoint()
         load_valid_event_nos()
+
         if args.full_sync: command_full_sync()
         elif args.incremental: command_incremental()
         elif args.resume: command_resume()
-        if task_name not in ["show-status", "reset"]:
+        
+        if task_name in ["full-sync", "incremental", "resume"]:
             verify_consistency()
+
     except Exception as e:
         logger.error(f"任務 '{task_name}' 執行期間發生未處理的致命錯誤: {e}", exc_info=True)
         MIGRATION_STATS["verification_results"].append(f"❌ FAIL: 任務因異常而終止 - {e}")
@@ -643,7 +731,9 @@ def main():
         if pg_conn: pg_conn.close()
         if mongo_client: mongo_client.close()
         end_time = datetime.datetime.now()
-        log_summary_report(start_time, end_time, task_name)
+        
+        if not (getattr(args, 'show_status', False) or getattr(args, 'reset', False)):
+            log_summary_report(start_time, end_time, task_name)
         logger.info(f"===== 遷移任務結束: {task_name} =====")
 
 if __name__ == "__main__":
